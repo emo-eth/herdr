@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::protocol::{
     ClientKeyCode, ClientKeyKind, ClientMouseButton, ClientMouseKind, ClientPaneInputEvent,
@@ -178,6 +179,16 @@ pub(crate) struct ClientConnection {
     /// Last coherent shell replacement sent to this client.
     pub(crate) shell_snapshot: Option<crate::protocol::ClientShellSnapshot>,
     pub(crate) shell_agent_completions: Option<crate::protocol::endpoint::EndpointAgentCompletions>,
+    /// Unprojected raw metadata baseline for computing delta updates.
+    pub(crate) raw_shell_snapshot: Option<crate::protocol::ClientShellSnapshot>,
+    /// Latest unsent snapshot, coalesced across API mutations in one quiet window.
+    pub(crate) pending_raw_shell_snapshot: Option<crate::protocol::ClientShellSnapshot>,
+    /// When the last snapshot replacement was actually written to this client.
+    pub(crate) last_snapshot_streamed_at: Option<Instant>,
+    /// Negotiated snapshot codec for this connection.
+    pub(crate) snapshot_codec: String,
+    /// Negotiated surface codec for this connection.
+    pub(crate) surface_codec: String,
     /// View policy paired with the last coherent shell replacement.
     pub(crate) shell_agent_view: Option<crate::api::schema::AgentViewSetParams>,
     /// Monotonic shell replacement revision for this connection.
@@ -248,6 +259,11 @@ impl ClientConnection {
             shell_location: None,
             shell_snapshot: None,
             shell_agent_completions: None,
+            raw_shell_snapshot: None,
+            pending_raw_shell_snapshot: None,
+            last_snapshot_streamed_at: None,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.to_string(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.to_string(),
             shell_agent_view: None,
             shell_projection_revision: 0,
             shell_endpoint_command_in_flight: false,

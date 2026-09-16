@@ -514,6 +514,15 @@ impl HeadlessServer {
             self.stream_host_mouse_capture_mode();
             self.stream_direct_terminal_keyboard_mode();
 
+            if self
+                .clients
+                .values()
+                .any(|client| client.pending_raw_shell_snapshot.is_some())
+            {
+                needs_render = true;
+                needs_full_render = true;
+            }
+
             // 7. Render virtually and stream frames. Hidden-only PTY work keeps a
             // bounded classification cadence without delaying presentation work
             // that joins the same coalesced request.
@@ -753,32 +762,55 @@ impl HeadlessServer {
         );
     }
 
-    fn sync_foreground_client_state(&mut self) {
-        self.app.pixel_mouse_available = self.foreground_client_id.is_some_and(|id| {
+    fn sync_foreground_client_state(&mut self) -> bool {
+        let mut visual_changed = false;
+        let pixel_mouse = self.foreground_client_id.is_some_and(|id| {
             self.clients
                 .get(&id)
                 .is_some_and(|client| client.pixel_mouse)
         });
+        if self.app.pixel_mouse_available != pixel_mouse {
+            self.app.pixel_mouse_available = pixel_mouse;
+            visual_changed = true;
+        }
         let Some(client_id) = self.foreground_client_id else {
-            self.effective_size = self.headless_size;
-            self.app.state.outer_terminal_focus = None;
-            self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+            if self.effective_size != self.headless_size {
+                self.effective_size = self.headless_size;
+                visual_changed = true;
+            }
+            if self.app.state.outer_terminal_focus.is_some() {
+                self.app.state.outer_terminal_focus = None;
+                visual_changed = true;
+            }
+            if self.app.state.host_cell_size != crate::kitty_graphics::HostCellSize::default() {
+                self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+                visual_changed = true;
+            }
             self.sync_runtime_view_geometry();
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
             self.sync_visible_server_config_diagnostic(false);
-            return;
+            return visual_changed;
         };
         let Some(client) = self.clients.get(&client_id) else {
             self.foreground_client_id = None;
-            self.effective_size = self.headless_size;
-            self.app.state.outer_terminal_focus = None;
-            self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+            if self.effective_size != self.headless_size {
+                self.effective_size = self.headless_size;
+                visual_changed = true;
+            }
+            if self.app.state.outer_terminal_focus.is_some() {
+                self.app.state.outer_terminal_focus = None;
+                visual_changed = true;
+            }
+            if self.app.state.host_cell_size != crate::kitty_graphics::HostCellSize::default() {
+                self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+                visual_changed = true;
+            }
             self.sync_runtime_view_geometry();
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
             self.sync_visible_server_config_diagnostic(false);
-            return;
+            return visual_changed;
         };
 
         let terminal_size = client.terminal_size;
@@ -793,21 +825,31 @@ impl HeadlessServer {
         let host_terminal_appearance_explicit = client.host_terminal_appearance_explicit;
         let outer_terminal_focus = client.outer_terminal_focus;
 
-        self.effective_size = terminal_size;
+        if self.effective_size != terminal_size {
+            self.effective_size = terminal_size;
+            visual_changed = true;
+        }
         self.sync_runtime_view_geometry();
-        self.app.state.outer_terminal_focus = outer_terminal_focus;
-        self.app.state.host_cell_size = host_cell_size;
+        if self.app.state.outer_terminal_focus != outer_terminal_focus {
+            self.app.state.outer_terminal_focus = outer_terminal_focus;
+            visual_changed = true;
+        }
+        if self.app.state.host_cell_size != host_cell_size {
+            self.app.state.host_cell_size = host_cell_size;
+            visual_changed = true;
+        }
         let server_keybindings = self.server_keybindings.clone();
         apply_keybindings(&mut self.app, &server_keybindings);
         self.sync_visible_server_config_diagnostic(false);
         if outer_terminal_focus == Some(true) {
-            self.app.state.mark_active_tab_seen();
+            visual_changed |= self.app.state.mark_active_tab_seen();
         }
-        self.app.set_host_terminal_appearance_state(
+        visual_changed |= self.app.set_host_terminal_appearance_state(
             host_terminal_appearance,
             host_terminal_appearance_explicit,
         );
-        self.app.set_host_terminal_theme(host_terminal_theme);
+        visual_changed |= self.app.set_host_terminal_theme(host_terminal_theme);
+        visual_changed
     }
 
     fn sync_visible_server_config_diagnostic(&mut self, uses_local_keybindings: bool) {
@@ -869,12 +911,11 @@ impl HeadlessServer {
 
     fn promote_latest_remaining_client(&mut self) -> bool {
         let next_foreground = latest_shell_client(&self.clients);
-        let changed = next_foreground != self.foreground_client_id;
+        let changed = self.foreground_client_id != next_foreground;
         self.foreground_client_id = next_foreground;
         self.sync_foreground_client_state();
         changed
     }
-
     fn app_client_count(&self) -> usize {
         self.clients
             .values()
@@ -1161,7 +1202,9 @@ impl HeadlessServer {
                     return false;
                 }
                 let foreground_changed = self.promote_client_to_foreground(client_id);
-                let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
+                let geometry_changed = self
+                    .claim_shell_tab_geometry_with_change(client_id, false)
+                    .unwrap_or(false);
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
                     workspace_index,
@@ -1201,7 +1244,9 @@ impl HeadlessServer {
                     return false;
                 }
                 let foreground_changed = self.promote_client_to_foreground(client_id);
-                let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
+                let geometry_changed = self
+                    .claim_shell_tab_geometry_with_change(client_id, false)
+                    .unwrap_or(false);
                 let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
                     return foreground_changed | geometry_changed;
                 };
@@ -1862,6 +1907,8 @@ impl HeadlessServer {
                 surface_reuse,
                 surface_delta,
                 surface_scroll,
+                snapshot_codec,
+                surface_codec,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -1912,6 +1959,8 @@ impl HeadlessServer {
                 connection
                     .render_state
                     .enable_surface_scroll(surface_scroll);
+                connection.snapshot_codec = snapshot_codec;
+                connection.surface_codec = surface_codec;
                 connection.shell_projection_revision = 1;
                 let config_diagnostic = if endpoint_keybindings {
                     self.server_config_diagnostic.as_deref()
@@ -2381,8 +2430,10 @@ impl HeadlessServer {
                 }
                 let foreground_changed =
                     interaction && self.promote_client_to_foreground(client_id);
-                let geometry_changed =
-                    interaction && self.claim_shell_tab_geometry(client_id, false);
+                let geometry_changed = interaction
+                    && self
+                        .claim_shell_tab_geometry_with_change(client_id, false)
+                        .unwrap_or(false);
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
                     workspace_index,
@@ -2463,8 +2514,10 @@ impl HeadlessServer {
                 }
                 let foreground_changed =
                     interaction && self.promote_client_to_foreground(client_id);
-                let geometry_changed =
-                    interaction && self.claim_shell_tab_geometry(client_id, false);
+                let geometry_changed = interaction
+                    && self
+                        .claim_shell_tab_geometry_with_change(client_id, false)
+                        .unwrap_or(false);
                 let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
                     return foreground_changed | geometry_changed;
                 };

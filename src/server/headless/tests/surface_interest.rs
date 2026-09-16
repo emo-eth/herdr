@@ -77,6 +77,8 @@ async fn metadata_only_shell_is_isolated_until_surface_activation() {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: false,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
             writer,
         })
     );
@@ -293,6 +295,8 @@ async fn background_surface_activation_preserves_focused_viewer_geometry() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: false,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
             writer,
         })
     );
@@ -407,6 +411,8 @@ async fn presentation_sync_epoch_replays_modes_and_title() {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: true,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
             writer,
         })
     );
@@ -524,6 +530,8 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: true,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
             writer: source_writer,
         })
     );
@@ -548,6 +556,8 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: false,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
             writer: target_writer,
         })
     );
@@ -692,7 +702,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
         panic!("expected target pane surface");
     };
     assert_eq!(
-        activation.receive_surface(&target_id, 7, coherent_surface),
+        activation.receive_surface(&target_id, 7, coherent_surface, Some(&mut shell)),
         crate::client::endpoint::SurfaceActivationProgress::Ready
     );
 
@@ -767,7 +777,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
         panic!("expected synchronized target surface");
     };
     assert_eq!(
-        activation.receive_surface(&target_id, 7, sync_surface),
+        activation.receive_surface(&target_id, 7, sync_surface, Some(&mut shell)),
         crate::client::endpoint::SurfaceActivationProgress::Ready
     );
     assert_eq!(

@@ -419,6 +419,8 @@ pub(crate) enum ServerEvent {
         surface_reuse: bool,
         surface_delta: bool,
         surface_scroll: bool,
+        snapshot_codec: String,
+        surface_codec: String,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -772,22 +774,46 @@ pub(crate) fn handle_client_handshake(
                 write_endpoint_rejection(&mut stream, code, reason);
                 return Ok(());
             }
+            let snapshot_codec = if hello
+                .snapshot_codecs
+                .iter()
+                .any(|c| c == crate::protocol::endpoint::SNAPSHOT_CODEC_DELTA_V2)
+            {
+                crate::protocol::endpoint::SNAPSHOT_CODEC_DELTA_V2.to_string()
+            } else {
+                crate::protocol::endpoint::SNAPSHOT_CODEC_V1.to_string()
+            };
+            let surface_codec = if hello
+                .surface_codecs
+                .iter()
+                .any(|c| c == crate::protocol::endpoint::SURFACE_CODEC_DELTA_V2)
+            {
+                crate::protocol::endpoint::SURFACE_CODEC_DELTA_V2.to_string()
+            } else {
+                crate::protocol::endpoint::SURFACE_CODEC_V1.to_string()
+            };
             (
                 hello.surface_size.cols,
                 hello.surface_size.rows,
                 hello.cell_width_px,
                 hello.cell_height_px,
                 false,
-                Some((
-                    hello.pixel_mouse,
-                    hello.direct_graphics,
-                    hello.endpoint_keybindings,
-                    hello.mouse_capture,
-                    hello.surface_active,
-                    hello.surface_reuse,
-                    hello.surface_delta,
-                    hello.surface_scroll,
-                )),
+                {
+                    let surface_scroll = hello.surface_scroll
+                        && surface_codec != crate::protocol::endpoint::SURFACE_CODEC_DELTA_V2;
+                    Some((
+                        hello.pixel_mouse,
+                        hello.direct_graphics,
+                        hello.endpoint_keybindings,
+                        hello.mouse_capture,
+                        hello.surface_active,
+                        hello.surface_reuse,
+                        hello.surface_delta,
+                        surface_scroll,
+                        snapshot_codec,
+                        surface_codec,
+                    ))
+                },
             )
         }
         ClientMessage::ClientShellHello { .. } => {
@@ -827,13 +853,22 @@ pub(crate) fn handle_client_handshake(
     } else {
         RenderEncoding::TerminalAnsi
     };
-    let welcome = if shell_options.is_some() {
-        let welcome = EndpointServerWelcome::compatible(
+    let welcome = if let Some((_, _, _, _, _, _, _, surface_scroll, ref snap_codec, ref surf_codec)) =
+        shell_options
+    {
+        let mut welcome = EndpointServerWelcome::compatible(
             crate::server::client_commands::supported_client_shell_method_names()
                 .iter()
                 .map(|method| (*method).to_owned())
                 .collect(),
         );
+        if !surface_scroll {
+            welcome
+                .capabilities
+                .retain(|c| c != crate::protocol::surface_scroll::CAPABILITY);
+        }
+        welcome.snapshot_codec = snap_codec.clone();
+        welcome.surface_codec = surf_codec.clone();
         ServerMessage::EndpointControl {
             kind: ENDPOINT_WELCOME_KIND.into(),
             data: serde_json::to_string(&welcome).map_err(io::Error::other)?,
@@ -884,6 +919,8 @@ pub(crate) fn handle_client_handshake(
         surface_reuse,
         surface_delta,
         surface_scroll,
+        snapshot_codec,
+        surface_codec,
     )) = shell_options
     {
         ServerEvent::ClientShellConnected {
@@ -900,6 +937,8 @@ pub(crate) fn handle_client_handshake(
             surface_reuse,
             surface_delta,
             surface_scroll,
+            snapshot_codec,
+            surface_codec,
             writer,
         }
     } else {
@@ -1995,6 +2034,8 @@ mod tests {
                 surface_reuse,
                 surface_delta,
                 surface_scroll,
+                snapshot_codec: _,
+                surface_codec: _,
                 writer,
             } => {
                 assert!(!surface_reuse);
