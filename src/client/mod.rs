@@ -1407,7 +1407,22 @@ async fn run_client_loop(
                                 }
                             }
                             Some(shell::ClientPaneSurfacePatchOutcome::Applied(None)) => true,
-                            Some(shell::ClientPaneSurfacePatchOutcome::Rejected) | None => false,
+                            Some(shell::ClientPaneSurfacePatchOutcome::Rejected) => {
+                                if let Some(shell) = state.shell.as_mut() {
+                                    request_surface_seed_if_needed(
+                                        shell,
+                                        &mut write_stream,
+                                        state.reported_size.0,
+                                        state.reported_size.1,
+                                        state.reported_cell_size.0,
+                                        state.reported_cell_size.1,
+                                        state.pixel_geometry_exact,
+                                    );
+                                }
+                                state.request_repaint();
+                                false
+                            }
+                            None => false,
                         };
                         apply_client_shell_input_source_changes(
                             &mut state,
@@ -2002,9 +2017,22 @@ async fn run_client_loop(
                                     Some(shell::ClientPaneSurfacePatchOutcome::Applied(None)) => {
                                         true
                                     }
-                                    Some(shell::ClientPaneSurfacePatchOutcome::Rejected) | None => {
+                                    Some(shell::ClientPaneSurfacePatchOutcome::Rejected) => {
+                                        if let Some(shell) = state.shell.as_mut() {
+                                            request_surface_seed_if_needed(
+                                                shell,
+                                                &mut write_stream,
+                                                state.reported_size.0,
+                                                state.reported_size.1,
+                                                state.reported_cell_size.0,
+                                                state.reported_cell_size.1,
+                                                state.pixel_geometry_exact,
+                                            );
+                                        }
+                                        state.request_repaint();
                                         false
                                     }
+                                    None => false,
                                 };
                                 apply_client_shell_input_source_changes(
                                     &mut state,

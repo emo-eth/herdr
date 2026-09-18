@@ -73,6 +73,13 @@ async fn surface_delta_reconstructs_metadata_text_and_hyperlinks() {
     );
     server.clients.get_mut(&1).unwrap().request_recompute();
     assert!(!server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    // Snapshot coalesce holds metadata-only revision bumps for 50ms. Expire it so
+    // the workspace rename is allowed to advance projection with this surface.
+    server
+        .clients
+        .get_mut(&1)
+        .unwrap()
+        .last_snapshot_streamed_at = None;
     server.render_and_stream();
     let (delta_bytes, delta_message) = receive_message(&render_rx);
     assert!(delta_bytes.len() < initial_bytes.len());
@@ -224,5 +231,59 @@ async fn surface_delta_preserves_graphics_baseline_through_queue_recovery() {
     assert!(!recovered.graphics.placements.is_empty());
     assert_eq!(recovered.graphics.assets.len(), 1);
     assert_eq!(recovered.graphics.assets[0].data, [0, 255, 0, 255]);
+    shutdown_test_runtimes(&mut server);
+}
+
+fn enable_v2(server: &mut HeadlessServer, client_id: u64) {
+    server
+        .clients
+        .get_mut(&client_id)
+        .expect("v2 client")
+        .surface_codec = crate::protocol::endpoint::SURFACE_CODEC_DELTA_V2.to_string();
+}
+
+#[tokio::test]
+async fn retained_path_emits_empty_v2_rebind_when_projection_advances() {
+    let (mut server, _control_rx, render_rx, pane_id) =
+        retained_test_server_with_control(b"quiet pane");
+    enable_v2(&mut server, 1);
+    server.render_and_stream();
+    let _ = receive_message(&render_rx);
+
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    assert!(
+        render_rx.try_recv().is_err(),
+        "quiet retained pass should not emit"
+    );
+
+    let baseline = server.clients[&1]
+        .render_state
+        .last_pane_surface()
+        .expect("seeded baseline")
+        .clone();
+    server
+        .clients
+        .get_mut(&1)
+        .unwrap()
+        .shell_projection_revision = baseline.projection_revision.saturating_add(1);
+    let expected_projection = server.clients[&1].shell_projection_revision;
+
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    let (_, message) = receive_message(&render_rx);
+    assert!(
+        matches!(
+            &message,
+            ServerMessage::EndpointControl { kind, .. }
+                if kind == crate::protocol::delta::SURFACE_CODEC_DELTA_V2
+        ),
+        "expected empty v2 rebind, got {message:?}"
+    );
+    let committed = server.clients[&1]
+        .render_state
+        .last_pane_surface()
+        .expect("rebind baseline")
+        .clone();
+    assert_eq!(committed.projection_revision, expected_projection);
+    assert_eq!(committed.frame, baseline.frame);
     shutdown_test_runtimes(&mut server);
 }

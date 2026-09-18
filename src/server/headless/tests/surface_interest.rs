@@ -884,3 +884,57 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
     shutdown_test_runtimes(&mut source_server);
     shutdown_test_runtimes(&mut target_server);
 }
+
+#[tokio::test]
+async fn activating_surface_discards_a_stale_queued_render() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("activate-discard");
+    let pane_id = workspace.focused_pane_id().expect("focused pane");
+    workspace.insert_test_runtime(
+        pane_id,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"queued"),
+    );
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+
+    let writer = crate::server::client_transport::ClientWriter::test_undrained_queue();
+    let client_id = 61;
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            client_id,
+            surface_cols: 80,
+            surface_rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+            direct_graphics: false,
+            endpoint_keybindings: false,
+            mouse_capture: false,
+            surface_active: true,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
+            writer,
+        })
+    );
+    server.render_and_stream();
+    let first_projection = server.clients[&client_id].shell_projection_revision;
+    assert!(server.clients[&client_id]
+        .render_state
+        .last_pane_surface()
+        .is_some());
+
+    request_active_surface(&mut server, client_id, "reactivate");
+    server.render_and_stream();
+    let last = server.clients[&client_id]
+        .render_state
+        .last_pane_surface()
+        .expect("activation must replace the discarded queued seed");
+    let after_projection = server.clients[&client_id].shell_projection_revision;
+    assert!(after_projection > first_projection);
+    assert_eq!(last.projection_revision, after_projection);
+    shutdown_test_runtimes(&mut server);
+}

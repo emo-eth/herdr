@@ -845,6 +845,9 @@ pub(crate) struct ClientShellState {
     /// pane surface always remains an exact snapshot pair.
     pub(super) pending_pane_surface: Option<PaneSurfaceFrame>,
     pub(super) unpresented_damage: HashMap<u16, (u16, u16)>,
+    /// Live delta/patch rejection asked the server for a full seed. Cleared when
+    /// a replacement `PaneSurface` installs so one skip cannot flood resizes.
+    surface_resync_pending: bool,
     pub(super) graphics: crate::kitty_graphics::surface::ClientState,
     pub(super) graphics_cell_size: crate::kitty_graphics::HostCellSize,
     pub(super) popup_terminal_id: Option<String>,
@@ -1006,6 +1009,7 @@ impl ClientShellState {
             pane_surface: None,
             pending_pane_surface: None,
             unpresented_damage: HashMap::new(),
+            surface_resync_pending: false,
             graphics: crate::kitty_graphics::surface::ClientState::default(),
             graphics_cell_size: crate::kitty_graphics::HostCellSize {
                 width_px: 1,
@@ -1205,6 +1209,7 @@ impl ClientShellState {
         self.hits = ShellHitMap::default();
         self.pane_surface = None;
         self.pending_pane_surface = None;
+        self.surface_resync_pending = false;
         self.input_leases = ClientInputLeases::default();
         self.popup_terminal_id = None;
         self.chrome_drag = None;
@@ -1584,6 +1589,15 @@ impl ClientShellState {
         self.pane_surface.is_some()
     }
 
+    /// Returns true the first time a live reject asks for a full seed.
+    pub(crate) fn begin_surface_resync(&mut self) -> bool {
+        if self.surface_resync_pending {
+            return false;
+        }
+        self.surface_resync_pending = true;
+        true
+    }
+
     pub(crate) fn set_pane_surface(&mut self, surface: PaneSurfaceFrame) {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
@@ -1776,6 +1790,7 @@ impl ClientShellState {
             .set_scene(std::mem::take(&mut surface.graphics));
         self.pane_surface = Some(surface);
         self.pane_surface_generation = self.active_snapshot_generation;
+        self.surface_resync_pending = false;
         self.invalidate_link_hover();
         self.resume_mobile_switcher_if_ready();
         self.reconcile_input_source();
@@ -1920,6 +1935,7 @@ impl ClientShellState {
     pub(crate) fn invalidate_pane_surface(&mut self) {
         self.pane_surface = None;
         self.pending_pane_surface = None;
+        self.surface_resync_pending = false;
         self.hits = ShellHitMap::default();
         self.host_mouse_pixels = None;
     }
