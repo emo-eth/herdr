@@ -246,8 +246,7 @@ impl ClientRenderState {
             return Some(seed_full_pane_surface(surface_revision, surface));
         }
 
-        if last.projection_revision == surface.projection_revision
-            && last.frame == surface.frame
+        if last.frame == surface.frame
             && last.panes == surface.panes
             && last.splits == surface.splits
             && last.popup == surface.popup
@@ -255,22 +254,31 @@ impl ClientRenderState {
             && last.graphics.retained_assets == surface.graphics.retained_assets
             && surface.graphics.assets.is_empty()
         {
-            return None;
-        }
-
-        if last.projection_revision != surface.projection_revision
-            && last.frame == surface.frame
-            && last.panes == surface.panes
-            && last.splits == surface.splits
-            && last.popup == surface.popup
-            && last.graphics.placements == surface.graphics.placements
-            && last.graphics.retained_assets == surface.graphics.retained_assets
-            && surface.graphics.assets.is_empty()
-        {
-            if let Some(last) = last_surface.as_mut() {
-                last.projection_revision = surface.projection_revision;
+            if last.projection_revision == surface.projection_revision {
+                return None;
             }
-            return None;
+            // Pixels and pane geometry are unchanged, but the snapshot generation moved.
+            // Activation requires snapshot.revision == surface.projection_revision, so emit
+            // an empty v2 rebind instead of going silent for a completely quiet pane.
+            let next_rev = surface_revision.saturating_add(1);
+            let delta = crate::protocol::delta::ClientShellSurfaceDelta {
+                boot_id: surface.boot_id.clone(),
+                projection_revision: surface.projection_revision,
+                base_surface_revision: last.surface_revision,
+                surface_revision: next_rev,
+                spans: Vec::new(),
+                row_moves: Vec::new(),
+                panes: Vec::new(),
+                splits: None,
+                cursor: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                appended_hyperlinks: Vec::new(),
+                graphics: None,
+                popup: None,
+            };
+            return match prepared_legacy_patch_or_v2_delta(last, delta) {
+                Some(prepared) => Some(prepared),
+                None => Some(seed_full_pane_surface(surface_revision, surface)),
+            };
         }
 
         let mut appended_hyperlinks = Vec::new();
@@ -1370,12 +1378,18 @@ mod tests {
 
         let mut rebind_candidate = popup_surface("second");
         rebind_candidate.projection_revision = 2;
-        assert!(
-            state.prepare_pane_surface_v2(rebind_candidate).is_none(),
-            "projection-only rebind stays local"
-        );
-        assert_eq!(state.last_pane_surface().unwrap().projection_revision, 2);
-        assert_eq!(state.last_pane_surface().unwrap().surface_revision, 2);
+        let prepared_rebind = state
+            .prepare_pane_surface_v2(rebind_candidate)
+            .expect("projection-only rebind");
+        assert!(matches!(
+            prepared_rebind.message(),
+            ServerMessage::EndpointControl { kind, .. }
+                if kind == crate::protocol::delta::SURFACE_CODEC_DELTA_V2
+        ));
+        state.commit_sent_frame(prepared_rebind);
+        let last = state.last_pane_surface().expect("rebind surface");
+        assert_eq!(last.projection_revision, 2);
+        assert_eq!(last.surface_revision, 3);
 
         let mut incompatible = popup_surface("second");
         incompatible.frame.width = 100;
@@ -1386,6 +1400,117 @@ mod tests {
             prepared_seed.message(),
             ServerMessage::PaneSurface(surface) if surface.frame.width == 100
         ));
+    }
+
+    fn client_snapshot(revision: u64) -> crate::protocol::ClientShellSnapshot {
+        crate::protocol::ClientShellSnapshot {
+            boot_id: "boot-1".into(),
+            revision,
+            config_diagnostic: None,
+            product_announcement: None,
+            update_available: None,
+            update_install_command: "herdr update".into(),
+            server_keybindings_toml: None,
+            latest_release_notes_available: false,
+            integration_updates_available: false,
+            worktree_directory: String::new(),
+            release_notes: None,
+            focused_workspace_id: None,
+            focused_tab_id: None,
+            focused_pane_id: None,
+            tab_bar_right: Vec::new(),
+            tab_bar_right_separator: String::new(),
+            agent_view_label: None,
+            agent_order: Vec::new(),
+            workspaces: Vec::new(),
+            tabs: Vec::new(),
+            panes: Vec::new(),
+            agents: Vec::new(),
+            commands: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn v2_metadata_projection_advance_preserves_baseline_for_subsequent_pty_delta() {
+        let mut server = ClientRenderState::new(RenderEncoding::SemanticFrame);
+        let mut client = crate::client::ClientShellState::new(
+            crate::client::ClientShellConfig::from_config(&crate::config::Config::default()),
+        );
+
+        client.set_snapshot(Box::new(client_snapshot(1)));
+
+        let initial_surface = pane_surface("PROMPT");
+        let initial_prepared = server
+            .prepare_pane_surface(initial_surface.clone())
+            .expect("initial seed");
+        let ServerMessage::PaneSurface(seed_surface) = initial_prepared.message() else {
+            panic!("expected pane surface seed");
+        };
+        client.set_pane_surface(seed_surface.clone());
+        let _ = client.compose(100, 30).expect("initial compose");
+        server.commit_sent_frame(initial_prepared);
+
+        let mut meta_surface = pane_surface("PROMPT");
+        meta_surface.projection_revision = 2;
+        let prepared_rebind = server
+            .prepare_pane_surface_v2(meta_surface)
+            .expect("quiet projection rebind");
+        let ServerMessage::EndpointControl { kind, data } = prepared_rebind.message() else {
+            panic!(
+                "expected empty v2 rebind for metadata-only projection advance, got {:?}",
+                prepared_rebind.message()
+            );
+        };
+        assert_eq!(kind, crate::protocol::delta::SURFACE_CODEC_DELTA_V2);
+        let rebind = crate::protocol::delta::decode_surface_delta(data).expect("decoded rebind");
+        assert!(rebind.spans.is_empty());
+        assert!(rebind.panes.is_empty());
+        assert_eq!(rebind.projection_revision, 2);
+        assert_eq!(rebind.base_surface_revision, 1);
+        assert_eq!(rebind.surface_revision, 2);
+
+        client.set_snapshot(Box::new(client_snapshot(2)));
+        client.apply_surface_delta(rebind);
+        let client_surface = client.pane_surface.as_ref().expect("client pane surface");
+        assert_eq!(client_surface.projection_revision, 2);
+        assert_eq!(client_surface.surface_revision, 2);
+        assert_eq!(client_surface.frame.cells[0].symbol, "P");
+        let _ = client.compose(100, 30).expect("compose after quiet rebind");
+        server.commit_sent_frame(prepared_rebind);
+
+        let mut pty_update = pane_surface("OUTPUT");
+        pty_update.projection_revision = 2;
+        let prepared_pty = server
+            .prepare_pane_surface_v2(pty_update)
+            .expect("pty after rebind");
+        let ServerMessage::PaneSurfacePatch(patch) = prepared_pty.message() else {
+            panic!(
+                "expected legacy patch after empty projection rebind, got {:?}",
+                prepared_pty.message()
+            );
+        };
+        client.apply_pane_surface_patch(patch.clone());
+        let client_surface = client.pane_surface.as_ref().expect("client pane surface");
+        assert_eq!(client_surface.projection_revision, 2);
+        assert_eq!(client_surface.surface_revision, 3);
+        assert_eq!(client_surface.frame.cells[0].symbol, "O");
+        server.commit_sent_frame(prepared_pty);
+
+        let mut steady_pty_update = pane_surface("STEADY");
+        steady_pty_update.projection_revision = 2;
+        let prepared_steady = server
+            .prepare_pane_surface_v2(steady_pty_update)
+            .expect("steady pty legacy patch");
+        let ServerMessage::PaneSurfacePatch(patch) = prepared_steady.message() else {
+            panic!(
+                "expected legacy patch for cell-only update on matched baseline, got {:?}",
+                prepared_steady.message()
+            );
+        };
+        client.apply_pane_surface_patch(patch.clone());
+        let client_surface = client.pane_surface.as_ref().expect("client pane surface");
+        assert_eq!(client_surface.surface_revision, 4);
+        assert_eq!(client_surface.frame.cells[0].symbol, "S");
     }
 
     #[test]
