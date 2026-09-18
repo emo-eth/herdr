@@ -763,10 +763,12 @@ impl HeadlessServer {
                 && !graphics_changed
                 && appended_hyperlinks.is_empty()
             {
-                // Metadata-only projection rebinds are applied locally on snapshot
-                // apply; do not emit an empty surface frame.
-                let _ = rebind_pending;
-                continue;
+                if !rebind_pending {
+                    continue;
+                }
+                // Snapshot generation moved without cell changes. Activation still
+                // requires snapshot.revision == surface.projection_revision, so emit
+                // the empty v2 rebind instead of succeeding with a silent skip.
             }
             updates.push(RetainedRecipientUpdate {
                 client_id,

@@ -137,6 +137,17 @@ impl ClientWriter {
         self.render.try_send(data).unwrap();
     }
 
+    /// Real one-slot render queue with no test drain thread. Use to prove
+    /// `discard_pending_render` unblocks a later seed.
+    #[cfg(test)]
+    pub(crate) fn test_undrained_queue() -> Self {
+        let queue = ClientWriterQueue::new();
+        Self {
+            control: ClientControlWriter::queue(queue.clone()),
+            render: ClientRenderWriter::queue(queue),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_close(&self) {
         self.render.queue.close_writer();

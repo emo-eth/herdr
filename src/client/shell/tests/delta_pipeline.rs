@@ -467,3 +467,37 @@ fn snapshot_skip_installs_pending_successor_so_receive_chain_continues() {
         .compose(100, 30)
         .expect("installed successor must remain presentable");
 }
+
+#[test]
+fn rejected_surface_delta_requests_a_single_resync() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    let _ = state.compose(100, 30).expect("initial compose");
+
+    let skipped = ClientShellSurfaceDelta {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        base_surface_revision: 99,
+        surface_revision: 100,
+        spans: Vec::new(),
+        row_moves: Vec::new(),
+        panes: Vec::new(),
+        splits: None,
+        cursor: SurfaceFieldUpdate::Unchanged,
+        appended_hyperlinks: Vec::new(),
+        graphics: None,
+        popup: None,
+    };
+    assert!(matches!(
+        state.apply_surface_delta(skipped),
+        crate::client::shell::surface_patch::ClientPaneSurfacePatchOutcome::Rejected
+    ));
+    assert!(state.begin_surface_resync());
+    assert!(!state.begin_surface_resync());
+
+    let mut seed = surface();
+    seed.surface_revision = 2;
+    state.set_pane_surface(seed);
+    assert!(state.begin_surface_resync());
+}
