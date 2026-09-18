@@ -1736,3 +1736,57 @@ fn pending_seed_graphics_removal_and_installed_delta_transitions() {
     );
     assert_eq!(shell.pane_surface.as_ref().unwrap().surface_revision, 3);
 }
+
+fn empty_rebind(
+    boot_id: &str,
+    projection: u64,
+    base: u64,
+    next: u64,
+) -> crate::protocol::delta::ClientShellSurfaceDelta {
+    crate::protocol::delta::ClientShellSurfaceDelta {
+        boot_id: boot_id.into(),
+        projection_revision: projection,
+        base_surface_revision: base,
+        surface_revision: next,
+        spans: Vec::new(),
+        row_moves: Vec::new(),
+        panes: Vec::new(),
+        splits: None,
+        cursor: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+        appended_hyperlinks: Vec::new(),
+        graphics: None,
+        popup: None,
+    }
+}
+
+#[test]
+fn empty_rebind_pairs_a_newer_snapshot_with_an_older_seed() {
+    let mut activation = machine();
+    let target = endpoint();
+    assert_eq!(
+        activation.receive_snapshot(&target, 7, &test_snapshot("remote-boot", 2)),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_surface(&target, 7, surface("remote-boot", 1, "pane"), None),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_surface_delta(&target, 7, empty_rebind("remote-boot", 2, 1, 2), None,),
+        SurfaceActivationProgress::Ready
+    );
+}
+
+#[test]
+fn surface_delta_without_a_seed_stays_pending() {
+    let mut activation = machine();
+    let target = endpoint();
+    assert_eq!(
+        activation.receive_snapshot(&target, 7, &test_snapshot("remote-boot", 2)),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_surface_delta(&target, 7, empty_rebind("remote-boot", 2, 1, 2), None,),
+        SurfaceActivationProgress::Pending
+    );
+}

@@ -87,6 +87,29 @@ pub(super) fn client_shell_resize_message(
     }
 }
 
+pub(super) fn request_surface_seed_if_needed(
+    shell: &mut shell::ClientShellState,
+    write_stream: &mut endpoint::EndpointRegistry,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    pixel_mouse: bool,
+) {
+    if !shell.begin_surface_resync() {
+        return;
+    }
+    let message = client_shell_resize_message(
+        shell,
+        cols,
+        rows,
+        cell_width_px,
+        cell_height_px,
+        pixel_mouse,
+    );
+    let _ = write_stream.send(&message);
+}
+
 pub(super) fn sync_client_shell_keyboard_report_all(
     state: &mut ClientState,
 ) -> Result<(), ClientError> {

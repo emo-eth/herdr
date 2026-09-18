@@ -598,8 +598,13 @@ impl PendingEndpointActivation {
                     let result = delta.apply_to(surface, &mut graphics);
                     surface.graphics = graphics;
                     if result.is_err() {
+                        tracing::debug!(
+                            "activation surface delta did not apply; waiting for a seed"
+                        );
                         return SurfaceActivationProgress::Pending;
                     }
+                } else {
+                    tracing::debug!("activation surface delta ignored without a seed surface");
                 }
             }
             ActivationPhase::SynchronizingPresentation { evidence, .. } => {
