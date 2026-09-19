@@ -703,7 +703,7 @@ impl HeadlessServer {
             let cursor_changed = cursor != surface.frame.cursor;
             let patch_is_empty = patch_rows.is_empty() && row_moves.is_empty();
             let rebind_pending = is_v2 && projection_revision != surface.projection_revision;
-            let payload = if is_v2 {
+            let mut payload = if is_v2 {
                 let delta = crate::protocol::delta::ClientShellSurfaceDelta {
                     boot_id: self.client_shell_boot_id.clone(),
                     projection_revision,
@@ -745,7 +745,7 @@ impl HeadlessServer {
                 };
                 let client = &self.clients[&client_id];
                 let mut next_surface = surface.clone();
-                match &payload {
+                match &mut payload {
                     RetainedRecipientPayload::Patch(p) => {
                         crate::server::render_stream::apply_pane_surface_patch(
                             &mut next_surface,
@@ -753,8 +753,11 @@ impl HeadlessServer {
                         );
                     }
                     RetainedRecipientPayload::Delta(d) => {
-                        let mut scene = crate::protocol::SurfaceGraphicsScene::default();
-                        let _ = d.apply_to(&mut next_surface, &mut scene);
+                        d.surface_revision = d.base_surface_revision.saturating_add(1);
+                        let mut scene = next_surface.graphics.clone();
+                        if d.apply_to(&mut next_surface, &mut scene).is_err() {
+                            fallback!("graphics_apply");
+                        }
                     }
                 }
                 let Some((graphics, delivery, sources)) =
@@ -846,22 +849,26 @@ impl HeadlessServer {
                 deferred += 1;
                 continue;
             };
+            let v2 = client.surface_codec == crate::protocol::endpoint::SURFACE_CODEC_DELTA_V2;
             let (prepared, graphics_delivery) = if let Some((surface, delivery, _)) = graphics {
-                (
+                let prepared = if v2 {
+                    client.render_state.prepare_pane_surface_v2(surface)
+                } else {
                     client
                         .render_state
-                        .prepare_pane_surface_with_file(surface, native_upload.is_some()),
-                    Some(delivery),
-                )
+                        .prepare_pane_surface_with_file(surface, native_upload.is_some())
+                };
+                (prepared, Some(delivery))
             } else {
-                match payload {
+                let prepared = match payload {
                     RetainedRecipientPayload::Patch(patch) => {
-                        (client.render_state.prepare_pane_surface_patch(patch), None)
+                        client.render_state.prepare_pane_surface_patch(patch)
                     }
                     RetainedRecipientPayload::Delta(delta) => {
-                        (client.render_state.prepare_pane_surface_delta(*delta), None)
+                        client.render_state.prepare_pane_surface_delta(*delta)
                     }
-                }
+                };
+                (prepared, None)
             };
             let Some(prepared) = prepared else {
                 client.defer_full_render();

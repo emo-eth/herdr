@@ -1790,3 +1790,58 @@ fn surface_delta_without_a_seed_stays_pending() {
         SurfaceActivationProgress::Pending
     );
 }
+
+#[test]
+fn compact_patch_advances_activation_evidence_before_empty_rebind() {
+    let mut activation = machine();
+    let target = endpoint();
+    assert_eq!(
+        activation.receive_snapshot(&target, 7, &test_snapshot("remote-boot", 2)),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_surface(&target, 7, surface("remote-boot", 1, "pane"), None),
+        SurfaceActivationProgress::Pending
+    );
+    let patch = crate::protocol::PaneSurfacePatch {
+        boot_id: "remote-boot".into(),
+        projection_revision: 1,
+        base_surface_revision: 1,
+        surface_revision: 2,
+        rows: Vec::new(),
+        panes: Vec::new(),
+        cursor: None,
+    };
+    assert_eq!(
+        activation.receive_surface_patch(&target, 7, patch, None),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_surface_delta(&target, 7, empty_rebind("remote-boot", 2, 2, 3), None),
+        SurfaceActivationProgress::Ready
+    );
+}
+
+#[test]
+fn rejected_activation_delta_marks_seed_resync() {
+    let mut activation = machine();
+    let target = endpoint();
+    assert_eq!(
+        activation.receive_snapshot(&target, 7, &test_snapshot("remote-boot", 2)),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_surface(&target, 7, surface("remote-boot", 1, "pane"), None),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_surface_delta(&target, 7, empty_rebind("remote-boot", 1, 99, 100), None),
+        SurfaceActivationProgress::Pending
+    );
+    match &activation.phase {
+        ActivationPhase::ActivatingTarget { evidence, .. } => {
+            assert!(evidence.seed_resync_pending);
+        }
+        other => panic!("expected activating target, got {other:?}"),
+    }
+}

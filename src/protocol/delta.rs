@@ -1748,6 +1748,89 @@ impl ClientShellSurfaceDelta {
     }
 }
 
+impl PaneSurfacePatch {
+    pub fn apply_to(&self, surface: &mut PaneSurfaceFrame) -> Result<(), String> {
+        if surface.boot_id != self.boot_id {
+            return Err(format!(
+                "surface patch boot_id mismatch: surface {} != patch {}",
+                surface.boot_id, self.boot_id
+            ));
+        }
+        if surface.surface_revision != self.base_surface_revision {
+            return Err(format!(
+                "surface patch base revision mismatch: surface {} != patch base {}",
+                surface.surface_revision, self.base_surface_revision
+            ));
+        }
+        if self.surface_revision <= self.base_surface_revision {
+            return Err("surface patch revision does not advance".into());
+        }
+        if self.projection_revision < surface.projection_revision {
+            return Err("surface patch projection revision is non-monotonic".into());
+        }
+        for updated in &self.panes {
+            let Some(existing) = surface
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == updated.pane_id)
+            else {
+                return Err(format!(
+                    "patch refers to unknown pane ID: {}",
+                    updated.pane_id
+                ));
+            };
+            if !pane_geometry_matches_legacy_patch(existing, updated) {
+                return Err(format!("patch pane geometry mismatch: {}", updated.pane_id));
+            }
+        }
+        for row in &self.rows {
+            if row.cells.is_empty() {
+                return Err("patch row has empty cells".into());
+            }
+            let Ok(len) = u16::try_from(row.cells.len()) else {
+                return Err("patch row cell length overflow".into());
+            };
+            if row.y >= surface.frame.height || row.x.saturating_add(len) > surface.frame.width {
+                return Err(format!(
+                    "patch row out of frame bounds: at ({}, {}) len {} frame ({}x{})",
+                    row.x, row.y, len, surface.frame.width, surface.frame.height
+                ));
+            }
+            let hits = surface.panes.iter().any(|base| {
+                let pane = self
+                    .panes
+                    .iter()
+                    .find(|pane| pane.pane_id == base.pane_id)
+                    .unwrap_or(base);
+                span_hits_pane_legacy_patch(row, pane)
+            });
+            if !hits {
+                return Err("patch row does not hit a pane".into());
+            }
+        }
+        for row in &self.rows {
+            let start = usize::from(row.y) * usize::from(surface.frame.width) + usize::from(row.x);
+            let end = start + row.cells.len();
+            if end > surface.frame.cells.len() {
+                return Err("patch row out of cell buffer".into());
+            }
+            surface.frame.cells[start..end].clone_from_slice(&row.cells);
+        }
+        for updated in &self.panes {
+            let pane = surface
+                .panes
+                .iter_mut()
+                .find(|pane| pane.pane_id == updated.pane_id)
+                .expect("validated patch pane");
+            pane.clone_from(updated);
+        }
+        surface.frame.cursor.clone_from(&self.cursor);
+        surface.projection_revision = self.projection_revision;
+        surface.surface_revision = self.surface_revision;
+        Ok(())
+    }
+}
+
 pub fn encode_snapshot_delta(delta: &ClientShellSnapshotDelta) -> serde_json::Result<String> {
     serde_json::to_string(delta)
 }
@@ -2211,5 +2294,60 @@ mod surface_tests {
             popup: None,
         };
         assert!(delta.into_legacy_patch(&surface).is_err());
+    }
+
+    #[test]
+    fn compact_patch_validates_rows_against_baseline_panes() {
+        let mut surface = make_test_surface(8, 2);
+        let mut pane_b = surface.panes[0].clone();
+        pane_b.pane_id = "pane-2".into();
+        pane_b.rect.x = 4;
+        pane_b.rect.width = 4;
+        pane_b.inner_rect.x = 4;
+        pane_b.inner_rect.width = 4;
+        surface.panes[0].rect.width = 4;
+        surface.panes[0].inner_rect.width = 4;
+        surface.panes.push(pane_b);
+        let mut pane_a = surface.panes[0].clone();
+        pane_a.mouse_reporting = true;
+        let patch = PaneSurfacePatch {
+            boot_id: "test-boot".into(),
+            projection_revision: 1,
+            base_surface_revision: 10,
+            surface_revision: 11,
+            rows: vec![
+                PaneSurfacePatchRow {
+                    x: 0,
+                    y: 0,
+                    cells: vec![CellData {
+                        symbol: "A".into(),
+                        fg: 0,
+                        bg: 0,
+                        modifier: 0,
+                        skip: false,
+                        hyperlink: None,
+                    }],
+                },
+                PaneSurfacePatchRow {
+                    x: 4,
+                    y: 0,
+                    cells: vec![CellData {
+                        symbol: "B".into(),
+                        fg: 0,
+                        bg: 0,
+                        modifier: 0,
+                        skip: false,
+                        hyperlink: None,
+                    }],
+                },
+            ],
+            panes: vec![pane_a],
+            cursor: None,
+        };
+        patch.apply_to(&mut surface).expect("sparse patch applies");
+        assert_eq!(surface.frame.cells[0].symbol, "A");
+        assert_eq!(surface.frame.cells[4].symbol, "B");
+        assert!(surface.panes[0].mouse_reporting);
+        assert_eq!(surface.surface_revision, 11);
     }
 }

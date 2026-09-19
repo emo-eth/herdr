@@ -501,3 +501,85 @@ fn rejected_surface_delta_requests_a_single_resync() {
     state.set_pane_surface(seed);
     assert!(state.begin_surface_resync());
 }
+
+#[test]
+fn sparse_pane_metadata_still_accepts_rows_for_other_panes() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut current = surface();
+    current.frame.width = 8;
+    current.frame.height = 2;
+    current.frame.cells = vec![cell_with_symbol(" "); 16];
+    current.panes[0].rect.width = 4;
+    current.panes[0].inner_rect.width = 4;
+    let mut pane_b = current.panes[0].clone();
+    pane_b.pane_id = "pane_2".into();
+    pane_b.rect.x = 4;
+    pane_b.inner_rect.x = 4;
+    current.panes.push(pane_b);
+    state.set_pane_surface(current);
+    let _ = state.compose(100, 30).expect("compose two panes");
+
+    let mut pane_a = surface().panes.remove(0);
+    pane_a.rect.width = 4;
+    pane_a.inner_rect.width = 4;
+    pane_a.mouse_reporting = true;
+    let patch = crate::protocol::PaneSurfacePatch {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        base_surface_revision: 1,
+        surface_revision: 2,
+        rows: vec![
+            PaneSurfacePatchRow {
+                x: 0,
+                y: 0,
+                cells: vec![cell_with_symbol("A"), cell_with_symbol("A")],
+            },
+            PaneSurfacePatchRow {
+                x: 4,
+                y: 0,
+                cells: vec![cell_with_symbol("B"), cell_with_symbol("B")],
+            },
+        ],
+        panes: vec![pane_a],
+        cursor: None,
+    };
+    assert!(matches!(
+        state.apply_pane_surface_patch(patch),
+        crate::client::shell::surface_patch::ClientPaneSurfacePatchOutcome::Applied(_)
+    ));
+    let surface = state.pane_surface.as_ref().expect("patched surface");
+    assert_eq!(surface.frame.cells[0].symbol, "A");
+    assert_eq!(surface.frame.cells[4].symbol, "B");
+    assert!(surface.panes[0].mouse_reporting);
+}
+
+#[test]
+fn v2_cell_delta_does_not_blit_through_an_unchanged_popup() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface_with_popup());
+    let _ = state.compose(100, 30).expect("compose popup");
+    let delta = ClientShellSurfaceDelta {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        base_surface_revision: 1,
+        surface_revision: 2,
+        spans: vec![PaneSurfacePatchRow {
+            x: 0,
+            y: 0,
+            cells: vec![cell_with_symbol("Z")],
+        }],
+        row_moves: Vec::new(),
+        panes: Vec::new(),
+        splits: None,
+        cursor: SurfaceFieldUpdate::Unchanged,
+        appended_hyperlinks: Vec::new(),
+        graphics: None,
+        popup: None,
+    };
+    assert!(matches!(
+        state.apply_surface_delta(delta),
+        crate::client::shell::surface_patch::ClientPaneSurfacePatchOutcome::Applied(None)
+    ));
+}

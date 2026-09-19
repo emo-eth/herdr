@@ -1465,16 +1465,14 @@ async fn run_client_loop(
                                     state.shell.as_mut(),
                                 )
                             });
-                            if matches!(progress, Some(endpoint::SurfaceActivationProgress::Ready))
-                            {
-                                if let Some(event) = complete_endpoint_activation(
-                                    &mut state,
-                                    &mut write_stream,
-                                    &mut pending_activation,
-                                    &mut endpoint_commands,
-                                )? {
-                                    scheduled_activation = Some(event);
-                                }
+                            if let Some(event) = note_activation_progress(
+                                progress,
+                                &mut state,
+                                &mut write_stream,
+                                &mut pending_activation,
+                                &mut endpoint_commands,
+                            )? {
+                                scheduled_activation = Some(event);
                             }
                             continue;
                         }
@@ -1496,6 +1494,26 @@ async fn run_client_loop(
                         }
                     }
                     ServerMessage::PaneSurfacePatch(patch) => {
+                        if activation_message {
+                            let progress = pending_activation.as_mut().map(|pending| {
+                                pending.receive_surface_patch(
+                                    &endpoint_id,
+                                    generation,
+                                    patch,
+                                    state.shell.as_mut(),
+                                )
+                            });
+                            if let Some(event) = note_activation_progress(
+                                progress,
+                                &mut state,
+                                &mut write_stream,
+                                &mut pending_activation,
+                                &mut endpoint_commands,
+                            )? {
+                                scheduled_activation = Some(event);
+                            }
+                            continue;
+                        }
                         let patch_started = crate::render_prof::timer();
                         let apply_started = crate::render_prof::timer();
                         let outcome = state
@@ -2107,18 +2125,14 @@ async fn run_client_loop(
                                             state.shell.as_mut(),
                                         )
                                     });
-                                    if matches!(
+                                    if let Some(event) = note_activation_progress(
                                         progress,
-                                        Some(endpoint::SurfaceActivationProgress::Ready)
-                                    ) {
-                                        if let Some(event) = complete_endpoint_activation(
-                                            &mut state,
-                                            &mut write_stream,
-                                            &mut pending_activation,
-                                            &mut endpoint_commands,
-                                        )? {
-                                            scheduled_activation = Some(event);
-                                        }
+                                        &mut state,
+                                        &mut write_stream,
+                                        &mut pending_activation,
+                                        &mut endpoint_commands,
+                                    )? {
+                                        scheduled_activation = Some(event);
                                     }
                                     continue;
                                 }
