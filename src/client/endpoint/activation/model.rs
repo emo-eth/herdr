@@ -19,6 +19,8 @@ pub(super) struct ActivationEvidence {
     pub(super) focused_tab_id: Option<String>,
     pub(super) focused_pane_id: Option<String>,
     pub(super) surface: Option<crate::protocol::PaneSurfaceFrame>,
+    /// Set when a compact patch or delta breaks the revision chain. Cleared by the next seed.
+    pub(super) seed_resync_pending: bool,
 }
 
 impl ActivationEvidence {
@@ -42,6 +44,7 @@ impl ActivationEvidence {
         });
         if replace {
             self.surface = Some(surface);
+            self.seed_resync_pending = false;
         }
     }
 

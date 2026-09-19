@@ -19,6 +19,87 @@ fn restore_mode_bar(
     }
 }
 
+fn install_pane_surface_hits(
+    hits: &mut ShellHitMap,
+    mouse_capture: bool,
+    area: Rect,
+    surface: &crate::protocol::PaneSurfaceFrame,
+) {
+    hits.panes = surface
+        .panes
+        .iter()
+        .map(|pane| PaneHit {
+            rect: Rect::new(
+                area.x.saturating_add(pane.rect.x),
+                area.y.saturating_add(pane.rect.y),
+                pane.rect.width,
+                pane.rect.height,
+            ),
+            inner_rect: Rect::new(
+                area.x.saturating_add(pane.inner_rect.x),
+                area.y.saturating_add(pane.inner_rect.y),
+                pane.inner_rect.width,
+                pane.inner_rect.height,
+            ),
+            scrollbar_rect: pane.scrollbar_rect.map(|rect| {
+                Rect::new(
+                    area.x.saturating_add(rect.x),
+                    area.y.saturating_add(rect.y),
+                    rect.width,
+                    rect.height,
+                )
+            }),
+            scroll: pane.scroll.map(|metrics| crate::pane::ScrollMetrics {
+                offset_from_bottom: usize::try_from(metrics.offset_from_bottom)
+                    .unwrap_or(usize::MAX),
+                max_offset_from_bottom: usize::try_from(metrics.max_offset_from_bottom)
+                    .unwrap_or(usize::MAX),
+                viewport_rows: usize::try_from(metrics.viewport_rows).unwrap_or(usize::MAX),
+            }),
+            pane_id: pane.pane_id.clone(),
+            content_revision: pane.content_revision,
+            popup: false,
+            mouse_reporting: pane.mouse_reporting,
+            sgr_pixel_mouse: pane.sgr_pixel_mouse,
+            pixel_width: pane.pixel_width,
+            pixel_height: pane.pixel_height,
+        })
+        .collect();
+    let topology_signature = pane_surface_topology_signature(surface);
+    hits.pane_splits = surface
+        .splits
+        .iter()
+        .map(|split| PaneSplitHit {
+            direction: split.direction,
+            pos: match split.direction {
+                crate::protocol::PaneSurfaceSplitDirection::Horizontal => {
+                    area.x.saturating_add(split.pos)
+                }
+                crate::protocol::PaneSurfaceSplitDirection::Vertical => {
+                    area.y.saturating_add(split.pos)
+                }
+            },
+            area: Rect::new(
+                area.x.saturating_add(split.area.x),
+                area.y.saturating_add(split.area.y),
+                split.area.width,
+                split.area.height,
+            ),
+            hit_rect: Rect::new(
+                area.x.saturating_add(split.hit_rect.x),
+                area.y.saturating_add(split.hit_rect.y),
+                split.hit_rect.width,
+                split.hit_rect.height,
+            ),
+            path: split.path.clone(),
+            topology_signature,
+        })
+        .collect();
+    if !mouse_capture {
+        hits.pane_splits.clear();
+    }
+}
+
 impl ClientShellState {
     fn compose_unavailable(&mut self, cols: u16, rows: u16) -> FrameData {
         let layout = self.layout(cols, rows);
@@ -220,79 +301,12 @@ impl ClientShellState {
                 workspace_drop_indicator_row,
             },
         );
-        self.hits.panes = surface
-            .panes
-            .iter()
-            .map(|pane| PaneHit {
-                rect: Rect::new(
-                    layout.pane_surface.x.saturating_add(pane.rect.x),
-                    layout.pane_surface.y.saturating_add(pane.rect.y),
-                    pane.rect.width,
-                    pane.rect.height,
-                ),
-                inner_rect: Rect::new(
-                    layout.pane_surface.x.saturating_add(pane.inner_rect.x),
-                    layout.pane_surface.y.saturating_add(pane.inner_rect.y),
-                    pane.inner_rect.width,
-                    pane.inner_rect.height,
-                ),
-                scrollbar_rect: pane.scrollbar_rect.map(|rect| {
-                    Rect::new(
-                        layout.pane_surface.x.saturating_add(rect.x),
-                        layout.pane_surface.y.saturating_add(rect.y),
-                        rect.width,
-                        rect.height,
-                    )
-                }),
-                scroll: pane.scroll.map(|metrics| crate::pane::ScrollMetrics {
-                    offset_from_bottom: usize::try_from(metrics.offset_from_bottom)
-                        .unwrap_or(usize::MAX),
-                    max_offset_from_bottom: usize::try_from(metrics.max_offset_from_bottom)
-                        .unwrap_or(usize::MAX),
-                    viewport_rows: usize::try_from(metrics.viewport_rows).unwrap_or(usize::MAX),
-                }),
-                pane_id: pane.pane_id.clone(),
-                content_revision: pane.content_revision,
-                popup: false,
-                mouse_reporting: pane.mouse_reporting,
-                sgr_pixel_mouse: pane.sgr_pixel_mouse,
-                pixel_width: pane.pixel_width,
-                pixel_height: pane.pixel_height,
-            })
-            .collect();
-        let topology_signature = pane_surface_topology_signature(surface);
-        self.hits.pane_splits = surface
-            .splits
-            .iter()
-            .map(|split| PaneSplitHit {
-                direction: split.direction,
-                pos: match split.direction {
-                    crate::protocol::PaneSurfaceSplitDirection::Horizontal => {
-                        layout.pane_surface.x.saturating_add(split.pos)
-                    }
-                    crate::protocol::PaneSurfaceSplitDirection::Vertical => {
-                        layout.pane_surface.y.saturating_add(split.pos)
-                    }
-                },
-                area: Rect::new(
-                    layout.pane_surface.x.saturating_add(split.area.x),
-                    layout.pane_surface.y.saturating_add(split.area.y),
-                    split.area.width,
-                    split.area.height,
-                ),
-                hit_rect: Rect::new(
-                    layout.pane_surface.x.saturating_add(split.hit_rect.x),
-                    layout.pane_surface.y.saturating_add(split.hit_rect.y),
-                    split.hit_rect.width,
-                    split.hit_rect.height,
-                ),
-                path: split.path.clone(),
-                topology_signature,
-            })
-            .collect();
-        if !self.config.mouse_capture {
-            self.hits.pane_splits.clear();
-        }
+        install_pane_surface_hits(
+            &mut self.hits,
+            self.config.mouse_capture,
+            layout.pane_surface,
+            surface,
+        );
         let mode_bar_area = if layout.mobile_header.is_empty()
             && self.config.tab_bar_position == TabBarPositionConfig::Bottom
             && !layout.tab_bar.is_empty()
@@ -774,6 +788,12 @@ impl ClientShellState {
                 dragged_workspace_id: None,
                 workspace_drop_indicator_row: None,
             },
+        );
+        install_pane_surface_hits(
+            &mut self.hits,
+            self.config.mouse_capture,
+            layout.pane_surface,
+            surface,
         );
 
         let pane_x = layout.pane_surface.x;

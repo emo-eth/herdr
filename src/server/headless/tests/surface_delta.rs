@@ -287,3 +287,63 @@ async fn retained_path_emits_empty_v2_rebind_when_projection_advances() {
     assert_eq!(committed.frame, baseline.frame);
     shutdown_test_runtimes(&mut server);
 }
+
+#[tokio::test]
+async fn retained_v2_graphics_stay_on_the_v2_codec() {
+    let (mut server, _control_rx, render_rx, pane_id) =
+        retained_test_server_with_control(b"text before image");
+    server.clients.get_mut(&1).unwrap().cell_size = crate::kitty_graphics::HostCellSize {
+        width_px: 10,
+        height_px: 20,
+    };
+    enable_v2(&mut server, 1);
+    server.render_and_stream();
+    let _ = receive_message(&render_rx);
+
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=1,r=1,q=2;/wAA/w==\x1b\\",
+    );
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    let (_, image_message) = receive_message(&render_rx);
+    assert!(
+        matches!(
+            &image_message,
+            ServerMessage::EndpointControl { kind, .. }
+                if kind == crate::protocol::delta::SURFACE_CODEC_DELTA_V2
+        ),
+        "v2 retained graphics must stay on the v2 codec, got {image_message:?}"
+    );
+    let image_baseline = server.clients[&1]
+        .render_state
+        .last_pane_surface()
+        .expect("image baseline")
+        .clone();
+    assert!(
+        image_baseline.graphics.assets.is_empty(),
+        "committed v2 baseline must drop wire-only asset payloads"
+    );
+    assert!(!image_baseline.graphics.placements.is_empty());
+
+    write_shared_test_pane(&mut server, pane_id, b"\rupdated text");
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    let (_, text_message) = receive_message(&render_rx);
+    match &text_message {
+        ServerMessage::EndpointControl { kind, .. }
+            if kind == crate::protocol::delta::SURFACE_CODEC_DELTA_V2 => {}
+        ServerMessage::PaneSurfacePatch(_) => {}
+        other => panic!("text behind a v2 image should stay on v2/compact encoding, got {other:?}"),
+    }
+    let text_baseline = server.clients[&1]
+        .render_state
+        .last_pane_surface()
+        .expect("text baseline")
+        .clone();
+    assert_eq!(
+        text_baseline.graphics.placements,
+        image_baseline.graphics.placements
+    );
+    assert!(text_baseline.graphics.assets.is_empty());
+    shutdown_test_runtimes(&mut server);
+}

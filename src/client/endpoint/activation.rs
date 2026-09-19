@@ -599,8 +599,9 @@ impl PendingEndpointActivation {
                     surface.graphics = graphics;
                     if result.is_err() {
                         tracing::debug!(
-                            "activation surface delta did not apply; waiting for a seed"
+                            "activation surface delta did not apply; requesting a seed"
                         );
+                        evidence.seed_resync_pending = true;
                         return SurfaceActivationProgress::Pending;
                     }
                 } else {
@@ -608,13 +609,20 @@ impl PendingEndpointActivation {
                 }
             }
             ActivationPhase::SynchronizingPresentation { evidence, .. } => {
+                let mut failed = false;
                 if let Some(surface) = evidence.surface.as_mut() {
                     let mut graphics = std::mem::take(&mut surface.graphics);
-                    let _ = delta.apply_to(surface, &mut graphics);
+                    failed = delta.apply_to(surface, &mut graphics).is_err();
                     surface.graphics = graphics;
                 }
                 if let Some(shell) = shell {
-                    let _ = shell.apply_surface_delta(delta);
+                    failed |= matches!(
+                        shell.apply_surface_delta(delta),
+                        crate::client::shell::ClientPaneSurfacePatchOutcome::Rejected
+                    );
+                }
+                if failed {
+                    evidence.seed_resync_pending = true;
                 }
             }
             ActivationPhase::AwaitingPresentationEffects { .. } => {
@@ -625,6 +633,102 @@ impl PendingEndpointActivation {
             _ => {}
         }
         self.progress()
+    }
+
+    pub(crate) fn receive_surface_patch(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        generation: u64,
+        patch: crate::protocol::PaneSurfacePatch,
+        shell: Option<&mut crate::client::shell::ClientShellState>,
+    ) -> SurfaceActivationProgress {
+        let lease = match &self.phase {
+            ActivationPhase::ActivatingTarget { .. } => &self.target,
+            ActivationPhase::RestoringSource { .. } => &self.source,
+            ActivationPhase::SynchronizingPresentation { lease, .. }
+            | ActivationPhase::AwaitingPresentationEffects { lease, .. } => lease,
+            _ => return SurfaceActivationProgress::Stale,
+        };
+        if !endpoint_matches(lease, endpoint_id, generation, &patch.boot_id) {
+            return SurfaceActivationProgress::Stale;
+        }
+        match &mut self.phase {
+            ActivationPhase::ActivatingTarget { evidence, .. }
+            | ActivationPhase::RestoringSource { evidence, .. } => {
+                if let Some(surface) = evidence.surface.as_mut() {
+                    if let Err(error) = patch.apply_to(surface) {
+                        tracing::debug!(
+                            error = %error,
+                            "activation compact patch did not apply; requesting a seed"
+                        );
+                        evidence.seed_resync_pending = true;
+                        return SurfaceActivationProgress::Pending;
+                    }
+                } else {
+                    tracing::debug!("activation compact patch ignored without a seed surface");
+                }
+            }
+            ActivationPhase::SynchronizingPresentation { evidence, .. } => {
+                let mut failed = evidence
+                    .surface
+                    .as_mut()
+                    .is_some_and(|surface| patch.apply_to(surface).is_err());
+                if let Some(shell) = shell {
+                    failed |= matches!(
+                        shell.apply_pane_surface_patch(patch),
+                        crate::client::shell::ClientPaneSurfacePatchOutcome::Rejected
+                    );
+                }
+                if failed {
+                    evidence.seed_resync_pending = true;
+                }
+            }
+            ActivationPhase::AwaitingPresentationEffects { .. } => {
+                if let Some(shell) = shell {
+                    let _ = shell.apply_pane_surface_patch(patch);
+                }
+            }
+            _ => {}
+        }
+        self.progress()
+    }
+
+    fn mark_seed_resync_pending(&mut self) {
+        match &mut self.phase {
+            ActivationPhase::ActivatingTarget { evidence, .. }
+            | ActivationPhase::RestoringSource { evidence, .. }
+            | ActivationPhase::SynchronizingPresentation { evidence, .. } => {
+                evidence.seed_resync_pending = true;
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn request_seed_if_needed(&mut self, endpoints: &mut EndpointRegistry) {
+        let needed = match &self.phase {
+            ActivationPhase::ActivatingTarget { evidence, .. }
+            | ActivationPhase::RestoringSource { evidence, .. }
+            | ActivationPhase::SynchronizingPresentation { evidence, .. } => {
+                evidence.seed_resync_pending
+            }
+            _ => false,
+        };
+        if !needed {
+            return;
+        }
+        match &mut self.phase {
+            ActivationPhase::ActivatingTarget { evidence, .. }
+            | ActivationPhase::RestoringSource { evidence, .. }
+            | ActivationPhase::SynchronizingPresentation { evidence, .. } => {
+                evidence.seed_resync_pending = false;
+            }
+            _ => {}
+        }
+        let resize = self.resize.clone();
+        if let Err(error) = self.update_resize(resize, endpoints) {
+            tracing::debug!(%error, "activation seed recovery resize failed");
+            self.mark_seed_resync_pending();
+        }
     }
 
     pub(crate) fn receive_presentation_effects_ready(
