@@ -1849,6 +1849,39 @@ impl ClientShellState {
                         pixel_height: pane.pixel_height,
                     })
                     .collect();
+                let topology_signature = super::pane_surface_topology_signature(surface);
+                self.hits.pane_splits = surface
+                    .splits
+                    .iter()
+                    .map(|split| PaneSplitHit {
+                        direction: split.direction,
+                        pos: match split.direction {
+                            crate::protocol::PaneSurfaceSplitDirection::Horizontal => {
+                                area.x.saturating_add(split.pos)
+                            }
+                            crate::protocol::PaneSurfaceSplitDirection::Vertical => {
+                                area.y.saturating_add(split.pos)
+                            }
+                        },
+                        area: Rect::new(
+                            area.x.saturating_add(split.area.x),
+                            area.y.saturating_add(split.area.y),
+                            split.area.width,
+                            split.area.height,
+                        ),
+                        hit_rect: Rect::new(
+                            area.x.saturating_add(split.hit_rect.x),
+                            area.y.saturating_add(split.hit_rect.y),
+                            split.hit_rect.width,
+                            split.hit_rect.height,
+                        ),
+                        path: split.path.clone(),
+                        topology_signature,
+                    })
+                    .collect();
+                if !self.config.mouse_capture {
+                    self.hits.pane_splits.clear();
+                }
             }
         }
     }

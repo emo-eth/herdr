@@ -523,3 +523,66 @@ fn close_confirmation_error_becomes_client_owned_overlay_and_stable_group_close(
             if params.workspace_id == "ws_1" && params.close_group
     ));
 }
+
+#[test]
+fn chrome_only_compose_keeps_pane_and_split_hits() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let layout = state.layout(80, 24);
+    let area = layout.pane_surface;
+    let mut pane_surface = surface();
+    pane_surface.frame.width = area.width;
+    pane_surface.frame.height = area.height;
+    pane_surface.frame.cells = vec![
+        crate::protocol::CellData {
+            symbol: " ".into(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink: None,
+        };
+        usize::from(area.width) * usize::from(area.height)
+    ];
+    pane_surface.panes[0].rect = SurfaceRect {
+        x: 0,
+        y: 0,
+        width: area.width,
+        height: area.height,
+    };
+    pane_surface.panes[0].inner_rect = pane_surface.panes[0].rect;
+    pane_surface.splits.push(PaneSurfaceSplit {
+        direction: PaneSurfaceSplitDirection::Horizontal,
+        pos: area.width / 2,
+        area: SurfaceRect {
+            x: 0,
+            y: 0,
+            width: area.width,
+            height: area.height,
+        },
+        hit_rect: SurfaceRect {
+            x: area.width / 2,
+            y: 0,
+            width: 1,
+            height: area.height,
+        },
+        path: vec![false, true],
+    });
+    state.set_pane_surface(pane_surface);
+    let frame = state.compose(80, 24).expect("full compose");
+    assert!(!state.hits.panes.is_empty());
+    assert!(!state.hits.pane_splits.is_empty());
+    let pane_count = state.hits.panes.len();
+    let split_count = state.hits.pane_splits.len();
+
+    let mut renamed = state.snapshot.as_deref().expect("snapshot").clone();
+    renamed.revision = 2;
+    renamed.workspaces[0].label = "renamed".into();
+    state.set_snapshot(Box::new(renamed));
+    assert!(
+        state.compose_chrome_patch(80, 24, Some(&frame)).is_some(),
+        "chrome-only snapshot update should patch"
+    );
+    assert_eq!(state.hits.panes.len(), pane_count);
+    assert_eq!(state.hits.pane_splits.len(), split_count);
+}

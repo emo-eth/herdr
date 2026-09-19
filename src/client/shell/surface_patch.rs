@@ -83,10 +83,7 @@ fn apply_patch_to_surface(
     true
 }
 
-fn fast_path_blocker(
-    state: &ClientShellState,
-    patch: &crate::protocol::PaneSurfacePatch,
-) -> Option<&'static str> {
+fn client_local_overlay_blocks_direct_blit(state: &ClientShellState) -> Option<&'static str> {
     if state.mode != ClientShellMode::Terminal {
         Some("client_surface_patch.fallback.mode")
     } else if state.overlay.is_some() {
@@ -101,14 +98,25 @@ fn fast_path_blocker(
         Some("client_surface_patch.fallback.notification")
     } else if state.copy_feedback.is_some() {
         Some("client_surface_patch.fallback.copy_feedback")
-    } else if state.link_hover_blocks_patch(patch) {
-        Some("client_surface_patch.fallback.link_hover")
     } else if state.selection.is_some() {
         Some("client_surface_patch.fallback.selection")
     } else if state.copy_mode.is_some() {
         Some("client_surface_patch.fallback.copy_mode")
     } else if state.selection_highlight_clear_deadline.is_some() {
         Some("client_surface_patch.fallback.selection_deadline")
+    } else {
+        None
+    }
+}
+
+fn fast_path_blocker(
+    state: &ClientShellState,
+    patch: &crate::protocol::PaneSurfacePatch,
+) -> Option<&'static str> {
+    if let Some(reason) = client_local_overlay_blocks_direct_blit(state) {
+        Some(reason)
+    } else if state.link_hover_blocks_patch(patch) {
+        Some("client_surface_patch.fallback.link_hover")
     } else if patch.panes.iter().any(|pane| {
         !state
             .hits
@@ -167,16 +175,16 @@ impl ClientShellState {
             }
         }
         for row in &patch.rows {
-            let pane_source = if patch.panes.is_empty() {
-                current.panes.as_slice()
-            } else {
-                patch.panes.as_slice()
-            };
             if !row_fits_frame(row, &current.frame)
                 || row.cells.is_empty()
-                || !pane_source
-                    .iter()
-                    .any(|pane| row_hits_pane(row, pane, current))
+                || !current.panes.iter().any(|base| {
+                    let pane = patch
+                        .panes
+                        .iter()
+                        .find(|pane| pane.pane_id == base.pane_id)
+                        .unwrap_or(base);
+                    row_hits_pane(row, pane, current)
+                })
             {
                 return ClientPaneSurfacePatchOutcome::Rejected;
             }
@@ -303,9 +311,16 @@ impl ClientShellState {
                 .map(|popup| popup.terminal_id.clone())
         });
 
-        if delta.popup.is_some() || delta.graphics.is_some() {
-            // Popup and graphics both require compose_graphics / overlay layout.
-            // The cell-only blit path presents IMAGE_REQUESTED text without Kitty APC.
+        let popup_visible = self
+            .pane_surface
+            .as_ref()
+            .is_some_and(|surface| surface.popup.is_some());
+        if delta.popup.is_some()
+            || delta.graphics.is_some()
+            || popup_visible
+            || client_local_overlay_blocks_direct_blit(self).is_some()
+        {
+            // Popup, graphics, and local overlays require compose rather than a cell blit.
             return ClientPaneSurfacePatchOutcome::Applied(None);
         }
 

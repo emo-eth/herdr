@@ -567,6 +567,9 @@ impl ClientRenderState {
                     *last_surface = None;
                     return;
                 }
+                // Asset payloads are wire-only. Keep placements and retained keys so
+                // later retained passes stay eligible (same invariant as full seeds).
+                graphics.assets.clear();
                 surface.graphics = graphics;
                 *surface_revision = delta.surface_revision;
                 let (index, bytes) = hyperlink_index_from_surface(surface);

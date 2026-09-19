@@ -375,6 +375,23 @@ pub(super) fn begin_endpoint_activation(
     Ok(())
 }
 
+pub(super) fn note_activation_progress(
+    progress: Option<endpoint::SurfaceActivationProgress>,
+    state: &mut ClientState,
+    endpoints: &mut endpoint::EndpointRegistry,
+    pending: &mut Option<endpoint::PendingEndpointActivation>,
+    endpoint_commands: &mut endpoint_commands::EndpointCommands,
+) -> Result<Option<ClientLoopEvent>, ClientError> {
+    if let Some(activation) = pending.as_mut() {
+        activation.request_seed_if_needed(endpoints);
+    }
+    if matches!(progress, Some(endpoint::SurfaceActivationProgress::Ready)) {
+        complete_endpoint_activation(state, endpoints, pending, endpoint_commands)
+    } else {
+        Ok(None)
+    }
+}
+
 pub(super) fn complete_endpoint_activation(
     state: &mut ClientState,
     endpoints: &mut endpoint::EndpointRegistry,
