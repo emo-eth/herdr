@@ -317,6 +317,26 @@ impl ClientShellState {
         })
     }
 
+    pub(super) fn link_hover_blocks_delta(
+        &self,
+        delta: &crate::protocol::delta::ClientShellSurfaceDelta,
+    ) -> bool {
+        self.link_hover.as_ref().is_some_and(|hover| {
+            !hover.regions.is_empty()
+                && (delta
+                    .panes
+                    .iter()
+                    .any(|pane| pane.pane_id == hover.target.pane_id)
+                    || delta.spans.iter().any(|span| {
+                        let inner = hover.target.inner_rect;
+                        span.y >= inner.y
+                            && span.y < inner.y.saturating_add(inner.height)
+                            && span.x < inner.x.saturating_add(inner.width)
+                            && span.x.saturating_add(span.cells.len() as u16) > inner.x
+                    }))
+        })
+    }
+
     pub(super) fn render_link_hover(
         &self,
         frame: &mut FrameData,

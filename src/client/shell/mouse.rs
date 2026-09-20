@@ -174,11 +174,49 @@ impl ClientShellState {
                 .filter(|selection| selection.is_in_progress())?
                 .pane_id
         };
-        self.hits
-            .panes
-            .iter()
-            .find(|hit| &hit.pane_id == pane_id)
-            .cloned()
+        if let Some(hit) = self.hits.panes.iter().find(|hit| &hit.pane_id == pane_id) {
+            return Some(hit.clone());
+        }
+        let surface = self.pane_surface.as_ref()?;
+        let (cols, rows) = self.last_composed_size?;
+        let layout = self.layout(cols, rows);
+        let pane = surface.panes.iter().find(|p| &p.pane_id == pane_id)?;
+        Some(PaneHit {
+            rect: Rect::new(
+                layout.pane_surface.x.saturating_add(pane.rect.x),
+                layout.pane_surface.y.saturating_add(pane.rect.y),
+                pane.rect.width,
+                pane.rect.height,
+            ),
+            inner_rect: Rect::new(
+                layout.pane_surface.x.saturating_add(pane.inner_rect.x),
+                layout.pane_surface.y.saturating_add(pane.inner_rect.y),
+                pane.inner_rect.width,
+                pane.inner_rect.height,
+            ),
+            scrollbar_rect: pane.scrollbar_rect.map(|rect| {
+                Rect::new(
+                    layout.pane_surface.x.saturating_add(rect.x),
+                    layout.pane_surface.y.saturating_add(rect.y),
+                    rect.width,
+                    rect.height,
+                )
+            }),
+            scroll: pane.scroll.map(|metrics| crate::pane::ScrollMetrics {
+                offset_from_bottom: usize::try_from(metrics.offset_from_bottom)
+                    .unwrap_or(usize::MAX),
+                max_offset_from_bottom: usize::try_from(metrics.max_offset_from_bottom)
+                    .unwrap_or(usize::MAX),
+                viewport_rows: usize::try_from(metrics.viewport_rows).unwrap_or(usize::MAX),
+            }),
+            pane_id: pane.pane_id.clone(),
+            content_revision: pane.content_revision,
+            popup: false,
+            mouse_reporting: pane.mouse_reporting,
+            sgr_pixel_mouse: pane.sgr_pixel_mouse,
+            pixel_width: pane.pixel_width,
+            pixel_height: pane.pixel_height,
+        })
     }
 
     fn update_selection_cursor_with_metrics(
@@ -2246,6 +2284,11 @@ impl ClientShellState {
                             if mouse.modifiers.is_empty() {
                                 self.last_pane_click = Some(click);
                             }
+                            self.selection_focus_confirmed = self
+                                .snapshot
+                                .as_deref()
+                                .and_then(|snapshot| snapshot.focused_pane_id.as_deref())
+                                == Some(hit.pane_id.as_str());
                             self.selection = Some(crate::selection::Selection::anchor(
                                 hit.pane_id.clone(),
                                 mouse.row.saturating_sub(hit.inner_rect.y),

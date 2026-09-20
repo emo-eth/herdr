@@ -763,6 +763,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
         activation.receive_response(&target_id, 7, &sync_request_id, &sync_data, &mut endpoints,),
         crate::client::endpoint::SurfaceActivationProgress::Pending
     );
+    std::thread::sleep(std::time::Duration::from_millis(55));
     target_server.render_and_stream();
     let sync_snapshot = loop {
         let message =

@@ -893,6 +893,7 @@ pub(crate) struct ClientShellState {
     pub(super) url_click_consumes_until_up: bool,
     pub(super) replaying_url_click: bool,
     pub(super) selection: Option<crate::selection::Selection<String>>,
+    pub(super) selection_focus_confirmed: bool,
     pub(super) last_pane_click: Option<ClientPaneClick>,
     pub(super) selection_autoscroll: Option<ClientSelectionAutoscroll>,
     pub(super) selection_autoscroll_deadline: Option<std::time::Instant>,
@@ -1058,6 +1059,7 @@ impl ClientShellState {
             url_click_consumes_until_up: false,
             replaying_url_click: false,
             selection: None,
+            selection_focus_confirmed: false,
             last_pane_click: None,
             selection_autoscroll: None,
             selection_autoscroll_deadline: None,
@@ -1251,6 +1253,7 @@ impl ClientShellState {
         self.url_click_consumes_until_up = false;
         self.replaying_url_click = false;
         self.selection = None;
+        self.selection_focus_confirmed = false;
         self.last_pane_click = None;
         self.selection_autoscroll = None;
         self.selection_autoscroll_deadline = None;
@@ -1423,15 +1426,25 @@ impl ClientShellState {
                     && focused_pane.is_some_and(|pane_id| pane_id != gesture.pane_id))
         } else {
             self.selection.as_ref().is_some_and(|selection| {
-                snapshot.focused_pane_id.as_deref() != Some(selection.pane_id.as_str())
-                    || !snapshot
-                        .panes
-                        .iter()
-                        .any(|pane| pane.pane_id == selection.pane_id)
+                let pane_exists = snapshot
+                    .panes
+                    .iter()
+                    .any(|pane| pane.pane_id == selection.pane_id);
+                if !pane_exists {
+                    return true;
+                }
+                let focused_pane = snapshot.focused_pane_id.as_deref();
+                self.selection_focus_confirmed |= focused_pane == Some(selection.pane_id.as_str());
+                if selection.is_in_progress() {
+                    return false;
+                }
+                self.selection_focus_confirmed
+                    && focused_pane.is_some_and(|focused_id| focused_id != selection.pane_id)
             })
         };
         if selection_focus_lost {
             self.selection = None;
+            self.selection_focus_confirmed = false;
             self.selection_autoscroll = None;
             self.selection_autoscroll_deadline = None;
             self.selection_highlight_clear_deadline = None;
@@ -1726,6 +1739,7 @@ impl ClientShellState {
         if selection_invalidated {
             self.word_selection_gesture = None;
             self.selection = None;
+            self.selection_focus_confirmed = false;
             self.stop_selection_autoscroll();
             self.selection_highlight_clear_deadline = None;
         }

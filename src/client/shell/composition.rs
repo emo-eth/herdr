@@ -739,6 +739,7 @@ impl ClientShellState {
             || self.visible_notification.is_some()
             || self.copy_feedback.is_some()
             || self.selection.is_some()
+            || self.word_selection_gesture.is_some()
             || self.copy_mode.is_some()
             || self.selection_highlight_clear_deadline.is_some()
         {

@@ -805,6 +805,7 @@ fn popup_delta(
                 || last.title != next.title
                 || last.width != next.width
                 || last.height != next.height
+                || last.frame.hyperlinks != next.frame.hyperlinks
             {
                 return Some(crate::protocol::delta::ClientShellPopupDelta {
                     seed: Some(Box::new(next.clone())),

@@ -1239,9 +1239,6 @@ pub struct PaneSurfacePaneDelta {
 
 impl PaneSurfacePaneDelta {
     pub fn diff(base: &PaneSurfacePane, next: &PaneSurfacePane) -> Option<Self> {
-        if base.wire_visible_eq(next) {
-            return None;
-        }
         if base == next {
             return None;
         }
@@ -1349,7 +1346,11 @@ pub(crate) fn pane_geometry_matches_legacy_patch(
         && left.pixel_height == right.pixel_height
 }
 
-fn span_hits_pane_legacy_patch(span: &PaneSurfacePatchRow, pane: &PaneSurfacePane) -> bool {
+fn span_hits_pane_legacy_patch(
+    span: &PaneSurfacePatchRow,
+    pane: &PaneSurfacePane,
+    base: Option<&PaneSurfacePane>,
+) -> bool {
     let Ok(len) = u16::try_from(span.cells.len()) else {
         return false;
     };
@@ -1357,7 +1358,10 @@ fn span_hits_pane_legacy_patch(span: &PaneSurfacePatchRow, pane: &PaneSurfacePan
         && span.y >= pane.inner_rect.y
         && span.y < pane.inner_rect.y.saturating_add(pane.inner_rect.height)
         && span.x.saturating_add(len) <= pane.inner_rect.x.saturating_add(pane.inner_rect.width);
-    let scrollbar_row = pane.scrollbar_rect.is_some_and(|rect| {
+    let scrollbar_rect = pane
+        .scrollbar_rect
+        .or_else(|| base.and_then(|b| b.scrollbar_rect));
+    let scrollbar_row = scrollbar_rect.is_some_and(|rect| {
         span.x == rect.x
             && span.y >= rect.y
             && span.y < rect.y.saturating_add(rect.height)
@@ -1406,7 +1410,7 @@ impl ClientShellSurfaceDelta {
             if !last
                 .panes
                 .iter()
-                .any(|pane| span_hits_pane_legacy_patch(span, pane))
+                .any(|pane| span_hits_pane_legacy_patch(span, pane, None))
             {
                 return Err(self);
             }
@@ -1802,7 +1806,7 @@ impl PaneSurfacePatch {
                     .iter()
                     .find(|pane| pane.pane_id == base.pane_id)
                     .unwrap_or(base);
-                span_hits_pane_legacy_patch(row, pane)
+                span_hits_pane_legacy_patch(row, pane, Some(base))
             });
             if !hits {
                 return Err("patch row does not hit a pane".into());

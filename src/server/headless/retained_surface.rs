@@ -765,13 +765,9 @@ impl HeadlessServer {
                 && !metadata_changed
                 && !graphics_changed
                 && appended_hyperlinks.is_empty()
+                && !rebind_pending
             {
-                if !rebind_pending {
-                    continue;
-                }
-                // Snapshot generation moved without cell changes. Activation still
-                // requires snapshot.revision == surface.projection_revision, so emit
-                // the empty v2 rebind instead of succeeding with a silent skip.
+                continue;
             }
             updates.push(RetainedRecipientUpdate {
                 client_id,
@@ -820,9 +816,7 @@ impl HeadlessServer {
                 (prepared, None)
             };
             let Some(prepared) = prepared else {
-                client.defer_full_render();
-                deferred += 1;
-                continue;
+                fallback!("prepare_yielded");
             };
             let max_frame_size = if graphics_delivery.is_some() {
                 MAX_GRAPHICS_FRAME_SIZE
@@ -838,9 +832,7 @@ impl HeadlessServer {
                             %error,
                             "failed to serialize retained pane surface patch"
                         );
-                        client.defer_full_render();
-                        deferred += 1;
-                        continue;
+                        fallback!("patch_serialize_failed");
                     }
                 };
             crate::render_prof::counter("retained_surface.bytes", serialized.len() as u64);
