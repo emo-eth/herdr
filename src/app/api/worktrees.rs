@@ -2492,4 +2492,119 @@ mod tests {
             PathBuf::from("/repo/other")
         );
     }
+
+    #[tokio::test]
+    async fn api_worktree_open_no_focus_preserves_none_active_and_mode_for_new_checkout() {
+        let repo = create_committed_repo("api-open-nofocus-none-repo");
+        let checkout = unique_temp_path("api-open-nofocus-none-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/api-nofocus-none",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        let mut app = app_with_parent(&repo);
+        let second_tab = app.state.workspaces[0].test_add_tab(Some("second"));
+        app.state.workspaces[0].active_tab = second_tab;
+        let original_pane = app.state.workspaces[0].tabs[second_tab].layout.focused();
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = crate::app::Mode::Navigate;
+
+        let response = app.handle_api_request(Request {
+            id: "req-nofocus-none".into(),
+            method: crate::api::schema::Method::WorktreeOpen(WorktreeOpenParams {
+                workspace_id: Some(app.state.workspaces[0].id.clone()),
+                path: Some(checkout.display().to_string()),
+                focus: false,
+                ..WorktreeOpenParams::default()
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorktreeOpened { .. }
+        ));
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.active, None);
+        assert_eq!(app.state.selected, 0);
+        assert_eq!(app.state.mode, crate::app::Mode::Navigate);
+        assert_eq!(app.state.workspaces[0].active_tab, second_tab);
+        assert_eq!(
+            app.state.workspaces[0].tabs[second_tab].layout.focused(),
+            original_pane
+        );
+
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false, false);
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn api_worktree_open_creates_source_parent_without_stealing_focus() {
+        let repo = create_committed_repo("api-open-source-parent-repo");
+        let checkout = unique_temp_path("api-open-source-parent-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/api-source-parent",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        let mut app = test_app();
+        let mut unrelated = Workspace::test_new("unrelated");
+        let second_tab = unrelated.test_add_tab(Some("second"));
+        unrelated.active_tab = second_tab;
+        let original_pane = unrelated.tabs[second_tab].layout.focused();
+        app.state.workspaces = vec![unrelated];
+        app.state.ensure_test_terminals();
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = crate::app::Mode::Navigate;
+
+        let response = app.handle_api_request(Request {
+            id: "req-source-parent".into(),
+            method: crate::api::schema::Method::WorktreeOpen(WorktreeOpenParams {
+                cwd: Some(repo.display().to_string()),
+                path: Some(checkout.display().to_string()),
+                focus: false,
+                ..WorktreeOpenParams::default()
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap_or_else(|err| {
+            panic!("expected success response, got {response}: {err}");
+        });
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorktreeOpened { .. }
+        ));
+        assert_eq!(app.state.workspaces.len(), 3);
+        assert_eq!(app.state.active, None);
+        assert_eq!(app.state.selected, 0);
+        assert_eq!(app.state.mode, crate::app::Mode::Navigate);
+        assert_eq!(app.state.workspaces[0].active_tab, second_tab);
+        assert_eq!(
+            app.state.workspaces[0].tabs[second_tab].layout.focused(),
+            original_pane
+        );
+
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false, false);
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(repo);
+    }
 }

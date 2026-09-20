@@ -1830,6 +1830,64 @@ async fn deferred_worktree_response_moves_only_its_source_client() {
 }
 
 #[tokio::test]
+async fn workspace_create_no_focus_preserves_connected_client_location_when_active_is_none() {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("main");
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+
+    let (control, _) = connect_matching_test_shell(&mut server, 70);
+    let _ = control.recv().expect("initial snapshot");
+    let original_tab_id = server.shell_tab_id_for_client(70).unwrap();
+    let original_ws_id = server.app.public_workspace_id(0);
+    server.app.state.active = None;
+    server.app.state.mode = crate::app::Mode::Navigate;
+
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    let new_ws_dir =
+        std::env::temp_dir().join(format!("test-open-no-focus-dir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&new_ws_dir);
+    std::fs::create_dir_all(&new_ws_dir).unwrap();
+
+    server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        request: crate::api::schema::Request {
+            id: "req-ws-nofocus".into(),
+            method: crate::api::schema::Method::WorkspaceCreate(
+                crate::api::schema::WorkspaceCreateParams {
+                    source_workspace_id: None,
+                    cwd: Some(new_ws_dir.display().to_string()),
+                    focus: false,
+                    label: Some("new-bg".into()),
+                    env: Default::default(),
+                },
+            ),
+        },
+        respond_to,
+        response_write_complete: None,
+        stream_active: None,
+    });
+    let response = response_rx.recv().expect("response");
+    let _: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        server.clients[&70]
+            .shell_location
+            .as_ref()
+            .and_then(|loc| loc.focused_workspace_id.as_deref()),
+        Some(original_ws_id.as_str())
+    );
+    assert_eq!(
+        server.shell_tab_id_for_client(70).as_deref(),
+        Some(original_tab_id.as_str())
+    );
+    assert_eq!(server.app.state.active, None);
+
+    let _ = std::fs::remove_dir_all(new_ws_dir);
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
 async fn client_local_navigation_does_not_emit_global_focus_transitions() {
     let mut server = test_headless_server();
     let mut workspace = crate::workspace::Workspace::test_new("independent-focus");

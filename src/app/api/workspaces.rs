@@ -986,4 +986,60 @@ mod tests {
         assert_eq!(workspaces[0].workspace_id, moved_id);
         assert!(event_hub.events_after(0).is_empty());
     }
+
+    #[tokio::test]
+    async fn workspace_create_no_focus_preserves_none_active_and_mode() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("existing")];
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = crate::app::Mode::Navigate;
+
+        let response = app.handle_workspace_create(
+            "req-no-focus".into(),
+            WorkspaceCreateParams {
+                source_workspace_id: None,
+                cwd: None,
+                focus: false,
+                label: Some("bg".into()),
+                env: Default::default(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceCreated { .. }
+        ));
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.active, None);
+        assert_eq!(app.state.selected, 0);
+        assert_eq!(app.state.mode, crate::app::Mode::Navigate);
+
+        let response_focus = app.handle_workspace_create(
+            "req-focus".into(),
+            WorkspaceCreateParams {
+                source_workspace_id: None,
+                cwd: None,
+                focus: true,
+                label: Some("fg".into()),
+                env: Default::default(),
+            },
+        );
+        let success_focus: SuccessResponse = serde_json::from_str(&response_focus).unwrap();
+        assert!(matches!(
+            success_focus.result,
+            ResponseResult::WorkspaceCreated { .. }
+        ));
+        assert_eq!(app.state.workspaces.len(), 3);
+        assert_eq!(app.state.active, Some(2));
+        assert_eq!(app.state.selected, 2);
+        assert_eq!(app.state.mode, crate::app::Mode::Terminal);
+    }
 }

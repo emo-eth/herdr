@@ -152,7 +152,7 @@ impl App {
         let workspace_id = self.state.workspaces[idx].id.clone();
         let root_pane = self.state.workspaces[idx].tabs[0].root_pane.raw();
         crate::logging::workspace_created(&workspace_id, root_pane);
-        if focus || self.state.active.is_none() {
+        if focus {
             self.state.switch_workspace(idx);
             self.state.mode = Mode::Terminal;
         }
