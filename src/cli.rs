@@ -24,6 +24,7 @@ macro_rules! println {
 
 mod agent;
 mod api;
+mod clipboard;
 mod completion;
 mod integration;
 mod machine;
@@ -130,6 +131,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "plugin" => plugin::run_plugin_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
+        "clipboard" => clipboard::run_clipboard_command(&args[2..])?,
         _ => return Ok(CommandOutcome::NotCli),
     };
 
@@ -1182,5 +1184,24 @@ mod tests {
                 "5000",
             ]
         );
+    }
+
+    #[test]
+    fn bare_client_arg_passes_through_as_not_cli() {
+        let args = vec!["herdr".to_string(), "client".to_string()];
+        let outcome = super::maybe_run(&args).unwrap();
+        assert!(matches!(outcome, super::CommandOutcome::NotCli));
+    }
+
+    #[test]
+    fn clipboard_set_help_is_handled() {
+        let args = vec![
+            "herdr".to_string(),
+            "clipboard".to_string(),
+            "set".to_string(),
+            "--help".to_string(),
+        ];
+        let outcome = super::maybe_run(&args).unwrap();
+        assert!(matches!(outcome, super::CommandOutcome::Handled(0)));
     }
 }

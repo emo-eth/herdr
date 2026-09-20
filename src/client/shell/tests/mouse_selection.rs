@@ -1719,8 +1719,8 @@ fn mouse_drag_selection_rapid_snapshot_and_delta_interleaving() {
         row: pane.inner_rect.y,
         modifiers: KeyModifiers::empty(),
     })]);
-    // Selection was copied (copy_on_select defaults to true)
-    assert!(state.selection.is_none());
+    // Selection remains highlighted after mouse-up copy
+    assert!(state.selection.is_some());
 }
 
 #[test]
@@ -1776,4 +1776,101 @@ fn mouse_drag_selection_in_progress_wheel_scrolling() {
         ClientShellAction::Endpoint { request, .. }
             if matches!(&request.method, crate::api::schema::Method::PaneScroll(params) if params.pane_id == "pane_1")
     )));
+}
+
+#[test]
+fn client_selection_retained_across_mouse_up_and_prefix_and_delivered_to_plugin_action() {
+    let mut config = Config::default();
+    config.ui.copy_on_select = true;
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    let binding = crate::config::CustomCommandKeybind {
+        bindings: crate::config::ActionKeybinds::prefix("z"),
+        label: "prefix+z".into(),
+        command: "test.plugin".into(),
+        action: crate::config::CustomCommandAction::PluginAction,
+        description: None,
+        width: None,
+        height: None,
+    };
+    state.config.keybinds.keybinds.custom_commands.push(binding);
+    let mut projection = snapshot();
+    projection
+        .commands
+        .push(crate::protocol::ClientShellCommand {
+            command_id: "test-plugin".into(),
+            binding_label: "prefix+z".into(),
+            binding_labels: vec!["prefix+z".into()],
+            action: crate::protocol::ClientShellCommandAction::PluginAction,
+            description: None,
+        });
+    state.set_snapshot(Box::new(projection));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("pane frame");
+
+    let pane = state.hits.panes[0].clone();
+    let mut mouse = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: pane.inner_rect.x,
+        row: pane.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    };
+    state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]);
+    mouse.kind = MouseEventKind::Drag(MouseButton::Left);
+    mouse.column += 2;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]);
+    mouse.kind = MouseEventKind::Up(MouseButton::Left);
+    let release = state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]);
+    assert!(release.repaint);
+    assert!(matches!(
+        &release.actions[..],
+        [ClientShellAction::Endpoint { request, .. }]
+            if matches!(&request.method,
+                crate::api::schema::Method::PaneSelectionRead(params)
+                    if params.cursor == crate::api::schema::PaneTextPoint { row: 0, col: 2 })
+    ));
+    assert!(
+        state.selection.is_some(),
+        "selection must remain highlighted after mouse-up copy"
+    );
+
+    let prefix_key = crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+    let prefix_outcome = state.handle_raw_events(vec![RawInputEvent::Key(prefix_key)]);
+    assert!(prefix_outcome.repaint);
+    assert_eq!(state.mode, ClientShellMode::Prefix);
+    assert!(
+        state.selection.is_some(),
+        "selection must be preserved when entering prefix mode"
+    );
+
+    let z_key = crate::input::TerminalKey::new(KeyCode::Char('z'), KeyModifiers::empty());
+    let invoke_outcome = state.handle_raw_events(vec![RawInputEvent::Key(z_key)]);
+    assert_eq!(state.mode, ClientShellMode::Terminal);
+    let [ClientShellAction::Endpoint { request, .. }] = &invoke_outcome.actions[..] else {
+        panic!("expected endpoint request for custom command invocation");
+    };
+    let crate::api::schema::Method::CommandInvoke(params) = &request.method else {
+        panic!("expected CommandInvoke method");
+    };
+    assert_eq!(params.command_id, "test-plugin");
+    let selection = params
+        .selection
+        .as_ref()
+        .expect("selection must be attached to CommandInvokeParams");
+    assert_eq!(selection.pane_id, "pane_1");
+    assert_eq!(
+        selection.anchor,
+        crate::api::schema::PaneTextPoint { row: 0, col: 0 }
+    );
+    assert_eq!(
+        selection.cursor,
+        crate::api::schema::PaneTextPoint { row: 0, col: 2 }
+    );
+
+    let typing_key = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty());
+    let typing_outcome = state.handle_raw_events(vec![RawInputEvent::Key(typing_key)]);
+    assert!(typing_outcome.repaint);
+    assert!(
+        state.selection.is_none(),
+        "normal typing must clear the active selection"
+    );
 }

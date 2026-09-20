@@ -6710,6 +6710,112 @@ fn notification_show_api_reports_no_foreground_client() {
 }
 
 #[test]
+fn client_clipboard_set_api_reports_no_foreground_client() {
+    let mut server = test_headless_server();
+    server.foreground_client_id = None;
+
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request: api::schema::Request {
+            id: "clip_no_fg".into(),
+            method: api::schema::Method::ClientClipboardSet(
+                api::schema::ClientClipboardSetParams {
+                    text: "test".into(),
+                },
+            ),
+        },
+        respond_to,
+        response_write_complete: None,
+        stream_active: None,
+    });
+
+    assert!(changed);
+    let response = response_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap();
+    let parsed: api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+    assert_eq!(parsed.error.code, "no_foreground_client");
+}
+
+#[test]
+fn client_clipboard_set_api_forwards_to_foreground_client() {
+    use base64::Engine;
+
+    let mut server = test_headless_server();
+    let (client_1_tx, client_1_control_rx, _client_1_rx) = test_client_writer();
+    let (client_2_tx, client_2_control_rx, _client_2_rx) = test_client_writer();
+
+    server.clients.insert(
+        1,
+        ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(client_1_tx),
+        ),
+    );
+    server.clients.insert(
+        2,
+        ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(client_2_tx),
+        ),
+    );
+    server.foreground_client_id = Some(1);
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    assert!(
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "clip_set".into(),
+                method: api::schema::Method::ClientClipboardSet(
+                    api::schema::ClientClipboardSetParams {
+                        text: "remote text\nwith newline".into(),
+                    },
+                ),
+            },
+            respond_to,
+            response_write_complete: None,
+            stream_active: None,
+        })
+    );
+
+    let response = response_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap();
+    let parsed: api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        parsed.result,
+        api::schema::ResponseResult::ClientClipboardSet { delivered: true }
+    );
+    match read_server_message(
+        client_1_control_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("clipboard server message for foreground client"),
+    ) {
+        ServerMessage::Clipboard { data } => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&data)
+                .expect("valid base64");
+            assert_eq!(
+                String::from_utf8(decoded).unwrap(),
+                "remote text\nwith newline"
+            );
+        }
+        other => panic!("expected clipboard message, got {other:?}"),
+    }
+    assert!(
+        client_2_control_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "inactive client must receive zero clipboard messages"
+    );
+}
+
+#[test]
 fn notification_show_api_includes_sound_in_semantic_event() {
     let mut server = test_headless_server();
     let (client_tx, client_control_rx, _client_rx) = test_client_writer();

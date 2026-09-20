@@ -46,7 +46,8 @@ pub(super) fn command() -> Command {
         .subcommand(terminal_command())
         .subcommand(session_command())
         .subcommand(integration_command())
-        .subcommand(plugin_command());
+        .subcommand(plugin_command())
+        .subcommand(clipboard_command());
     configure_help(command, 0)
 }
 
@@ -905,6 +906,16 @@ fn integration_target_values() -> Vec<&'static str> {
 
 fn id_command(name: &'static str, id: &'static str, about: &'static str) -> Command {
     Command::new(name).about(about).arg(required(id, id))
+}
+
+fn clipboard_command() -> Command {
+    Command::new("clipboard")
+        .about("Manage clipboard content")
+        .subcommand(
+            Command::new("set")
+                .about("Set foreground client clipboard content")
+                .arg(flag("stdin").help("Read clipboard text from stdin")),
+        )
 }
 
 fn direction_option() -> Arg {

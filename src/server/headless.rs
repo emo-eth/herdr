@@ -1665,6 +1665,28 @@ impl HeadlessServer {
         .unwrap_or_else(|_| "{}".to_string())
     }
 
+    fn handle_client_clipboard_set_api(&mut self, id: String, text: &str) -> String {
+        use api::schema::ResponseResult;
+
+        let data = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        if self.send_to_foreground_client(ServerMessage::Clipboard { data }) {
+            serde_json::to_string(&api::schema::SuccessResponse {
+                id,
+                result: ResponseResult::ClientClipboardSet { delivered: true },
+            })
+            .unwrap_or_else(|_| "{}".to_string())
+        } else {
+            serde_json::to_string(&api::schema::ErrorResponse {
+                id,
+                error: api::schema::ErrorBody {
+                    code: "no_foreground_client".into(),
+                    message: "no foreground client connected".into(),
+                },
+            })
+            .unwrap_or_else(|_| "{}".to_string())
+        }
+    }
+
     fn drain_client_config_reload_request(&mut self) {
         if !self.app.state.request_client_config_reload {
             return;
@@ -3074,6 +3096,12 @@ impl HeadlessServer {
             }
             api::schema::Method::ClientWindowTitleClear(_) => {
                 let response = self.handle_client_window_title_api(msg.request.id.clone(), None);
+                let _ = msg.respond_to.send(response);
+                return true;
+            }
+            api::schema::Method::ClientClipboardSet(params) => {
+                let response =
+                    self.handle_client_clipboard_set_api(msg.request.id.clone(), &params.text);
                 let _ = msg.respond_to.send(response);
                 return true;
             }
