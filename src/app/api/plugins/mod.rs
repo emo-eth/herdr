@@ -877,6 +877,36 @@ mod tests {
             serde_json::from_str(&app.handle_pane_link_resolve("hover".into(), params)).unwrap();
         assert_eq!(response["error"]["code"], "stale_target");
     }
+    #[tokio::test]
+    async fn pane_link_activate_returns_url_and_handled() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("link")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public_id = app.public_pane_id(0, pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 4);
+        runtime.test_process_pty_bytes(b"visit https://example.com/test today");
+        let revision = runtime.content_seq();
+        app.terminal_runtimes.insert(terminal_id, runtime);
+        let params = PaneLinkActivateParams {
+            pane_id: public_id,
+            viewport_row: 0,
+            col: 10,
+            content_revision: Some(revision),
+            offset_from_bottom: Some(0),
+        };
+        let response = app.handle_api_request(Request {
+            id: "act".into(),
+            method: Method::PaneLinkActivate(params.clone()),
+        });
+        let val: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(val["result"]["url"], "https://example.com/test");
+        assert_eq!(val["result"]["handled"], false);
+    }
 
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
