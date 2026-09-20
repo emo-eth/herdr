@@ -791,6 +791,192 @@ fn pane_content_updates_preserve_live_ranges_until_geometry_or_screen_changes() 
 }
 
 #[test]
+fn mouse_drag_selection_survives_snapshot_focus_lag() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let mut multi_snapshot = snapshot();
+    let mut pane_2 = multi_snapshot.panes[0].clone();
+    pane_2.pane_id = "pane_2".into();
+    pane_2.focused = false;
+    multi_snapshot.panes.push(pane_2);
+    multi_snapshot.focused_pane_id = Some("pane_1".into());
+    state.set_snapshot(Box::new(multi_snapshot.clone()));
+
+    let mut pane_surface = surface();
+    let mut surface_pane_2 = pane_surface.panes[0].clone();
+    surface_pane_2.pane_id = "pane_2".into();
+    surface_pane_2.rect.x = 53;
+    surface_pane_2.inner_rect.x = 54;
+    surface_pane_2.focused = false;
+    pane_surface.panes.push(surface_pane_2);
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("composed frame");
+
+    let pane_2_hit = state
+        .hits
+        .panes
+        .iter()
+        .find(|h| h.pane_id == "pane_2")
+        .cloned()
+        .expect("pane_2 hit");
+
+    // User clicks down in pane_2 (unfocused pane) and drags
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: pane_2_hit.inner_rect.x,
+        row: pane_2_hit.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: pane_2_hit.inner_rect.x + 2,
+        row: pane_2_hit.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    let sel = state.selection.as_ref().expect("selection active");
+    assert_eq!(sel.pane_id, "pane_2");
+    assert!(sel.is_in_progress());
+
+    // An intermediate snapshot arrives where focused_pane_id is still pane_1 (focus in transit)
+    let mut lagging = multi_snapshot.clone();
+    lagging.revision += 1;
+    lagging.focused_pane_id = Some("pane_1".into());
+    state.set_snapshot(Box::new(lagging));
+
+    assert!(
+        state.selection.is_some(),
+        "in-progress selection must survive lagging focus snapshot"
+    );
+    let sel = state.selection.as_ref().unwrap();
+    assert_eq!(sel.pane_id, "pane_2");
+    assert!(sel.is_in_progress());
+    // User continues dragging in pane_2
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: pane_2_hit.inner_rect.x + 3,
+        row: pane_2_hit.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    assert_eq!(
+        state.selection.as_ref().unwrap().ordered_cells(),
+        ((0, 0), (0, 3))
+    );
+}
+
+#[test]
+fn mouse_drag_selection_survives_snapshot_focus_lag_after_release() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.config.copy_on_select = false;
+    let mut multi_snapshot = snapshot();
+    let mut pane_2 = multi_snapshot.panes[0].clone();
+    pane_2.pane_id = "pane_2".into();
+    pane_2.focused = false;
+    multi_snapshot.panes.push(pane_2);
+    multi_snapshot.focused_pane_id = Some("pane_1".into());
+    state.set_snapshot(Box::new(multi_snapshot.clone()));
+
+    let mut pane_surface = surface();
+    let mut surface_pane_2 = pane_surface.panes[0].clone();
+    surface_pane_2.pane_id = "pane_2".into();
+    surface_pane_2.rect.x = 53;
+    surface_pane_2.inner_rect.x = 54;
+    surface_pane_2.focused = false;
+    pane_surface.panes.push(surface_pane_2);
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("composed frame");
+
+    let pane_2_hit = state
+        .hits
+        .panes
+        .iter()
+        .find(|h| h.pane_id == "pane_2")
+        .cloned()
+        .expect("pane_2 hit");
+
+    // User clicks down in pane_2 (unfocused pane), drags, and releases
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: pane_2_hit.inner_rect.x,
+        row: pane_2_hit.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: pane_2_hit.inner_rect.x + 2,
+        row: pane_2_hit.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: pane_2_hit.inner_rect.x + 2,
+        row: pane_2_hit.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    let sel = state
+        .selection
+        .as_ref()
+        .expect("selection still active after mouse up");
+    assert_eq!(sel.pane_id, "pane_2");
+    assert!(sel.is_finalized());
+
+    // An intermediate snapshot arrives where focused_pane_id is still pane_1 (focus in transit)
+    let mut lagging = multi_snapshot.clone();
+    lagging.revision += 1;
+    lagging.focused_pane_id = Some("pane_1".into());
+    state.set_snapshot(Box::new(lagging));
+
+    assert!(
+        state.selection.is_some(),
+        "finalized selection must survive lagging focus snapshot"
+    );
+}
+
+#[test]
+fn mouse_drag_selection_survives_snapshot_revision_advance_clearing_hits() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("initial frame");
+    let pane = state.hits.panes[0].clone();
+
+    // Start drag
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: pane.inner_rect.x,
+        row: pane.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: pane.inner_rect.x + 2,
+        row: pane.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    // Snapshot revision advances ahead of surface, clearing state.hits
+    let mut advanced_snapshot = snapshot();
+    advanced_snapshot.revision = 2;
+    state.set_snapshot(Box::new(advanced_snapshot));
+    assert!(
+        state.hits.panes.is_empty(),
+        "hits should be cleared while awaiting matching surface"
+    );
+
+    // User continues dragging while hits are empty
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: pane.inner_rect.x + 3,
+        row: pane.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    let sel = state.selection.as_ref().expect("selection still active");
+    assert!(sel.is_in_progress());
+    assert_eq!(sel.ordered_cells(), ((0, 0), (0, 3)));
+}
+
+#[test]
 fn pane_mouse_input_keeps_stable_target_and_endpoint_encoding() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
@@ -1158,4 +1344,436 @@ fn context_menu_keyboard_and_outside_click_are_client_owned() {
         })]);
     assert!(outside.repaint);
     assert!(state.overlay.is_none());
+}
+
+fn cell_with_sym(symbol: &str) -> crate::protocol::CellData {
+    crate::protocol::CellData {
+        symbol: symbol.into(),
+        fg: 0,
+        bg: 0,
+        modifier: 0,
+        skip: false,
+        hyperlink: None,
+    }
+}
+
+#[test]
+fn mouse_drag_selection_clamps_to_active_pane_across_boundaries() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let mut multi_snapshot = snapshot();
+    let mut pane_2 = multi_snapshot.panes[0].clone();
+    pane_2.pane_id = "pane_2".into();
+    pane_2.focused = false;
+    multi_snapshot.panes.push(pane_2);
+    state.set_snapshot(Box::new(multi_snapshot));
+
+    let mut pane_surface = surface();
+    pane_surface.frame.width = 106;
+    pane_surface.frame.height = 20;
+    pane_surface.frame.cells = vec![cell_with_sym(" "); 106 * 20];
+    pane_surface.panes[0].rect.y = 1;
+    pane_surface.panes[0].inner_rect.y = 1;
+    pane_surface.panes[0].rect.width = 50;
+    pane_surface.panes[0].inner_rect.width = 50;
+    pane_surface.panes[0].rect.height = 18;
+    pane_surface.panes[0].inner_rect.height = 18;
+    pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 50,
+        viewport_rows: 18,
+    });
+
+    let mut surface_pane_2 = pane_surface.panes[0].clone();
+    surface_pane_2.pane_id = "pane_2".into();
+    surface_pane_2.rect.x = 53;
+    surface_pane_2.inner_rect.x = 54;
+    surface_pane_2.rect.width = 50;
+    surface_pane_2.inner_rect.width = 50;
+    surface_pane_2.focused = false;
+    pane_surface.panes.push(surface_pane_2);
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("composed frame");
+
+    let p1 = state
+        .hits
+        .panes
+        .iter()
+        .find(|h| h.pane_id == "pane_1")
+        .cloned()
+        .unwrap();
+    let p2 = state
+        .hits
+        .panes
+        .iter()
+        .find(|h| h.pane_id == "pane_2")
+        .cloned()
+        .unwrap();
+
+    // 1. MouseDown in pane_1 at (col 5, row 2)
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: p1.inner_rect.x + 5,
+        row: p1.inner_rect.y + 2,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    // 2. Drag far into pane_2 area (col = p2.inner_rect.x + 10, row = p1.inner_rect.y + 2)
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: p2.inner_rect.x + 10,
+        row: p1.inner_rect.y + 2,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    let sel = state.selection.as_ref().expect("selection active");
+    assert_eq!(
+        sel.pane_id, "pane_1",
+        "drag into another pane must not switch selection ownership"
+    );
+    assert!(sel.is_in_progress());
+    let rightmost_col = p1.inner_rect.width - 1;
+    assert_eq!(sel.ordered_cells(), ((52, 5), (52, rightmost_col)));
+
+    // 3. Drag vertically above pane_1 into tab bar (row 0)
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: p1.inner_rect.x + 1,
+        row: 0,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    let sel = state.selection.as_ref().expect("selection active");
+    assert_eq!(sel.pane_id, "pane_1");
+    assert_eq!(sel.ordered_cells(), ((44, 1), (52, 5)));
+    assert!(
+        state.selection_autoscroll.is_some(),
+        "dragging above pane should trigger autoscroll"
+    );
+
+    // 4. Drag vertically below bottom of pane_1
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: p1.inner_rect.x + 10,
+        row: p1.inner_rect.y + p1.inner_rect.height + 5,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    let sel = state.selection.as_ref().expect("selection active");
+    assert_eq!(sel.ordered_cells(), ((52, 5), (67, 10)));
+
+    // 5. Release mouse
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: p1.inner_rect.x + 10,
+        row: p1.inner_rect.y + p1.inner_rect.height + 5,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    assert!(
+        state.selection_autoscroll.is_none(),
+        "releasing mouse stops autoscroll"
+    );
+}
+
+#[test]
+fn mouse_drag_selection_survives_rapid_deltas_and_blocks_direct_blit() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface();
+    pane_surface.frame.width = 106;
+    pane_surface.frame.height = 20;
+    pane_surface.frame.cells = vec![cell_with_sym(" "); 106 * 20];
+    pane_surface.panes[0].rect.width = 50;
+    pane_surface.panes[0].inner_rect.width = 50;
+    pane_surface.panes[0].rect.height = 18;
+    pane_surface.panes[0].inner_rect.height = 18;
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("initial frame");
+    let pane = state.hits.panes[0].clone();
+
+    // Start drag
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: pane.inner_rect.x + 2,
+        row: pane.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: pane.inner_rect.x + 6,
+        row: pane.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    let sel = state.selection.as_ref().expect("drag active");
+    assert!(sel.is_in_progress());
+    assert_eq!(sel.ordered_cells(), ((0, 2), (0, 6)));
+
+    // Deliver rapid deltas while drag is in progress
+    for rev in 1..=5 {
+        let delta = crate::protocol::delta::ClientShellSurfaceDelta {
+            boot_id: "boot-1".into(),
+            projection_revision: 1,
+            base_surface_revision: rev,
+            surface_revision: rev + 1,
+            spans: vec![crate::protocol::PaneSurfacePatchRow {
+                x: 0,
+                y: 0,
+                cells: vec![cell_with_sym(&format!("{rev}"))],
+            }],
+            row_moves: Vec::new(),
+            panes: vec![crate::protocol::delta::PaneSurfacePaneDelta {
+                pane_id: "pane_1".into(),
+                content_revision: crate::protocol::delta::SurfaceFieldUpdate::Set(100 + rev),
+                scroll: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                focused: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                mouse_reporting: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                sgr_pixel_mouse: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                alternate_screen_active: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                scrollbar_rect: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                rect: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                inner_rect: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                pixel_width: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                pixel_height: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+            }],
+            splits: None,
+            cursor: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+            appended_hyperlinks: Vec::new(),
+            graphics: None,
+            popup: None,
+        };
+
+        let outcome = state.apply_surface_delta(delta);
+        // Direct cell blit MUST be blocked by active selection
+        assert!(
+            matches!(
+                outcome,
+                crate::client::shell::surface_patch::ClientPaneSurfacePatchOutcome::Applied(None)
+            ),
+            "active drag selection must block direct cell blit to prevent overwriting highlight"
+        );
+
+        // Selection remains intact and in progress despite advancing content_revision
+        assert!(
+            state.selection.as_ref().is_some_and(|s| s.is_in_progress()),
+            "in-progress drag selection must survive content delta"
+        );
+        assert_eq!(
+            state.selection.as_ref().unwrap().ordered_cells(),
+            ((0, 2), (0, 6))
+        );
+    }
+
+    // Drag further after deltas
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: pane.inner_rect.x + 10,
+        row: pane.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    assert_eq!(
+        state.selection.as_ref().unwrap().ordered_cells(),
+        ((0, 2), (0, 10))
+    );
+}
+
+#[test]
+fn direct_blit_blocked_when_selection_deadline_or_word_gesture_active() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("initial frame");
+
+    // 1. In terminal mode with no selection or overlay, direct blit is allowed
+    assert_eq!(
+        crate::client::shell::surface_patch::client_local_overlay_blocks_direct_blit(&state),
+        None
+    );
+
+    // 2. Selection active blocks direct blit
+    state.selection = Some(crate::selection::Selection::anchor(
+        "pane_1".into(),
+        0,
+        0,
+        None,
+    ));
+    assert_eq!(
+        crate::client::shell::surface_patch::client_local_overlay_blocks_direct_blit(&state),
+        Some("client_surface_patch.fallback.selection")
+    );
+    state.selection = None;
+
+    // 3. Selection highlight clear deadline blocks direct blit
+    state.selection_highlight_clear_deadline =
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+    assert_eq!(
+        crate::client::shell::surface_patch::client_local_overlay_blocks_direct_blit(&state),
+        Some("client_surface_patch.fallback.selection_deadline")
+    );
+    state.selection_highlight_clear_deadline = None;
+
+    // 4. Word selection gesture active blocks direct blit
+    let mut word_state = word_drag_state(false);
+    let _ = start_word_drag(&mut word_state);
+    assert!(word_state.word_selection_gesture.is_some());
+    assert_eq!(
+        crate::client::shell::surface_patch::client_local_overlay_blocks_direct_blit(&word_state),
+        Some("client_surface_patch.fallback.word_selection")
+    );
+}
+
+#[test]
+fn mouse_drag_selection_rapid_snapshot_and_delta_interleaving() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("initial frame");
+    let pane = state.hits.panes[0].clone();
+
+    // Start drag
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: pane.inner_rect.x,
+        row: pane.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    for step in 1u64..=4u64 {
+        // Drag step
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: pane.inner_rect.x + (step * 2) as u16,
+            row: pane.inner_rect.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        assert!(
+            state.selection.is_some(),
+            "selection must survive drag step {step}"
+        );
+
+        // Snapshot revision advances ahead of surface (clearing hits)
+        let mut snap = snapshot();
+        snap.revision = step + 1;
+        state.set_snapshot(Box::new(snap));
+        assert!(
+            state.hits.panes.is_empty(),
+            "hits cleared on revision advance"
+        );
+
+        // Drag step while hits are empty
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: pane.inner_rect.x + (step * 2 + 1) as u16,
+            row: pane.inner_rect.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        assert!(
+            state.selection.is_some(),
+            "selection must survive drag with empty hits"
+        );
+
+        // Surface delta arrives catching up
+        let delta = crate::protocol::delta::ClientShellSurfaceDelta {
+            boot_id: "boot-1".into(),
+            projection_revision: step + 1,
+            base_surface_revision: step,
+            surface_revision: step + 1,
+            spans: vec![crate::protocol::PaneSurfacePatchRow {
+                x: 0,
+                y: 0,
+                cells: vec![cell_with_sym("Z")],
+            }],
+            row_moves: Vec::new(),
+            panes: vec![crate::protocol::delta::PaneSurfacePaneDelta {
+                pane_id: "pane_1".into(),
+                content_revision: crate::protocol::delta::SurfaceFieldUpdate::Set(100 + step),
+                scroll: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                focused: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                mouse_reporting: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                sgr_pixel_mouse: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                alternate_screen_active: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                scrollbar_rect: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                rect: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                inner_rect: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                pixel_width: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+                pixel_height: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+            }],
+            splits: None,
+            cursor: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+            appended_hyperlinks: Vec::new(),
+            graphics: None,
+            popup: None,
+        };
+        state.apply_surface_delta(delta);
+        assert!(
+            state.selection.is_some(),
+            "selection must survive surface delta"
+        );
+    }
+
+    // Final release
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: pane.inner_rect.x + 9,
+        row: pane.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    // Selection was copied (copy_on_select defaults to true)
+    assert!(state.selection.is_none());
+}
+
+#[test]
+fn mouse_drag_selection_in_progress_wheel_scrolling() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface();
+    pane_surface.frame.width = 106;
+    pane_surface.frame.height = 20;
+    pane_surface.frame.cells = vec![cell_with_sym(" "); 106 * 20];
+    pane_surface.panes[0].rect.width = 50;
+    pane_surface.panes[0].inner_rect.width = 50;
+    pane_surface.panes[0].rect.height = 18;
+    pane_surface.panes[0].inner_rect.height = 18;
+    pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 5,
+        max_offset_from_bottom: 20,
+        viewport_rows: 5,
+    });
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("initial frame");
+    let pane = state.hits.panes[0].clone();
+
+    // Start drag
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: pane.inner_rect.x + 2,
+        row: pane.inner_rect.y + 2,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: pane.inner_rect.x + 5,
+        row: pane.inner_rect.y + 2,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    assert!(state.selection.as_ref().unwrap().is_in_progress());
+
+    // Scroll wheel up while dragging
+    let scroll_up =
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: pane.inner_rect.x + 5,
+            row: pane.inner_rect.y + 2,
+            modifiers: KeyModifiers::empty(),
+        })]);
+
+    assert!(scroll_up.repaint);
+    assert!(state.selection.as_ref().unwrap().is_in_progress());
+    assert!(scroll_up.actions.iter().any(|a| matches!(
+        a,
+        ClientShellAction::Endpoint { request, .. }
+            if matches!(&request.method, crate::api::schema::Method::PaneScroll(params) if params.pane_id == "pane_1")
+    )));
 }

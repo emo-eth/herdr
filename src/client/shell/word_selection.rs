@@ -135,6 +135,7 @@ impl ClientShellState {
                 .unwrap_or((gesture.cursor.1, gesture.cursor.1));
         let start = (gesture.anchor.0, anchor_start).min((gesture.cursor.0, start_col));
         let end = (gesture.anchor.0, anchor_end).max((gesture.cursor.0, end_col));
+        self.selection_focus_confirmed = gesture.focus_confirmed;
         self.selection = Some(crate::selection::Selection::absolute_range(
             gesture.pane_id.clone(),
             start,

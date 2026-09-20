@@ -646,6 +646,7 @@ impl ClientShellState {
             return;
         };
         let end_col = width.unwrap_or(copy_mode.geometry.0).saturating_sub(1);
+        self.selection_focus_confirmed = true;
         if linewise {
             copy_mode.selection = Some(ClientCopySelection::Linewise {
                 anchor_row: copy_mode.cursor.row,
@@ -671,6 +672,7 @@ impl ClientShellState {
         let Some(copy_mode) = self.copy_mode.as_ref() else {
             return;
         };
+        self.selection_focus_confirmed = true;
         let Some(selection) = copy_mode.selection else {
             return;
         };
@@ -828,6 +830,7 @@ impl ClientShellState {
                     (text_match.end.row, text_match.end.col),
                 ));
             }
+            self.selection_focus_confirmed = true;
         }
         let Some(copy_mode) = self.copy_mode.take() else {
             return;

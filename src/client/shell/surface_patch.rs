@@ -83,7 +83,9 @@ fn apply_patch_to_surface(
     true
 }
 
-fn client_local_overlay_blocks_direct_blit(state: &ClientShellState) -> Option<&'static str> {
+pub(super) fn client_local_overlay_blocks_direct_blit(
+    state: &ClientShellState,
+) -> Option<&'static str> {
     if state.mode != ClientShellMode::Terminal {
         Some("client_surface_patch.fallback.mode")
     } else if state.overlay.is_some() {
@@ -100,6 +102,8 @@ fn client_local_overlay_blocks_direct_blit(state: &ClientShellState) -> Option<&
         Some("client_surface_patch.fallback.copy_feedback")
     } else if state.selection.is_some() {
         Some("client_surface_patch.fallback.selection")
+    } else if state.word_selection_gesture.is_some() {
+        Some("client_surface_patch.fallback.word_selection")
     } else if state.copy_mode.is_some() {
         Some("client_surface_patch.fallback.copy_mode")
     } else if state.selection_highlight_clear_deadline.is_some() {
@@ -318,9 +322,10 @@ impl ClientShellState {
         if delta.popup.is_some()
             || delta.graphics.is_some()
             || popup_visible
+            || self.link_hover_blocks_delta(&delta)
             || client_local_overlay_blocks_direct_blit(self).is_some()
         {
-            // Popup, graphics, and local overlays require compose rather than a cell blit.
+            // Popup, graphics, link hover, and local overlays require compose rather than a cell blit.
             return ClientPaneSurfacePatchOutcome::Applied(None);
         }
 
