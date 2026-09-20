@@ -552,14 +552,6 @@ impl ClientShellState {
             outcome.repaint = true;
             return None;
         }
-        if self.mode != ClientShellMode::Copy
-            && self.copy_or_terminal_mode() != ClientShellMode::Copy
-            && self.selection.take().is_some()
-        {
-            self.stop_selection_autoscroll();
-            self.selection_highlight_clear_deadline = None;
-            outcome.repaint = true;
-        }
 
         match self.mode {
             ClientShellMode::Terminal => {
@@ -574,6 +566,13 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return None;
                 }
+                if self.copy_or_terminal_mode() != ClientShellMode::Copy
+                    && self.selection.take().is_some()
+                {
+                    self.stop_selection_autoscroll();
+                    self.selection_highlight_clear_deadline = None;
+                    outcome.repaint = true;
+                }
                 self.focused_pane_id().map(ClientInputTarget::Pane)
             }
             ClientShellMode::Prefix => {
@@ -587,6 +586,12 @@ impl ClientShellState {
                 if self.config.keybinds.matches_prefix(key) {
                     self.mode = return_mode;
                     outcome.repaint = true;
+                    if self.copy_or_terminal_mode() != ClientShellMode::Copy
+                        && self.selection.take().is_some()
+                    {
+                        self.stop_selection_autoscroll();
+                        self.selection_highlight_clear_deadline = None;
+                    }
                     return self.focused_pane_id().map(ClientInputTarget::Pane);
                 }
                 if key.code == KeyCode::Esc {

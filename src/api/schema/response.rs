@@ -202,6 +202,9 @@ pub enum ResponseResult {
         changed: bool,
         reason: ClientWindowTitleReason,
     },
+    ClientClipboardSet {
+        delivered: bool,
+    },
     IntegrationList {
         integrations: Vec<super::integrations::IntegrationInfo>,
     },

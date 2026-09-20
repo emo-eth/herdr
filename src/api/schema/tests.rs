@@ -373,6 +373,31 @@ fn client_window_title_requests_round_trip() {
 }
 
 #[test]
+fn client_clipboard_set_requests_round_trip() {
+    let set = Request {
+        id: "req_clip_set".into(),
+        method: Method::ClientClipboardSet(ClientClipboardSetParams {
+            text: "annotated selection\nline 2".into(),
+        }),
+    };
+    let json = serde_json::to_value(&set).unwrap();
+    assert_eq!(json["method"], "client.clipboard.set");
+    assert_eq!(json["params"]["text"], "annotated selection\nline 2");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, set);
+
+    let response = SuccessResponse {
+        id: "req_clip_set".into(),
+        result: ResponseResult::ClientClipboardSet { delivered: true },
+    };
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["result"]["type"], "client_clipboard_set");
+    assert_eq!(json["result"]["delivered"], true);
+    let restored: SuccessResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, response);
+}
+
+#[test]
 fn agent_view_requests_round_trip() {
     let set_json = serde_json::json!({
         "id": "view-set",
