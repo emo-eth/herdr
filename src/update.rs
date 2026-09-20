@@ -72,6 +72,7 @@ pub struct Version {
 impl Version {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.strip_prefix('v').unwrap_or(s);
+        let s = s.split(['-', '+']).next().unwrap_or(s);
         let parts: Vec<&str> = s.split('.').collect();
         if parts.len() != 3 {
             return None;
