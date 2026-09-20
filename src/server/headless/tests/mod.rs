@@ -1725,6 +1725,74 @@ async fn client_shell_tab_focus_changes_only_the_source_connection() {
     );
     shutdown_test_runtimes(&mut server);
 }
+#[tokio::test]
+async fn client_shell_pane_link_activate_resolves_and_activates() {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("link-test");
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+
+    let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
+        .attached_terminal_id
+        .clone();
+    server.app.terminal_runtimes.insert(
+        terminal_id.clone(),
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"https://example.com"),
+    );
+
+    let (control, render) = connect_test_shell(&mut server, 7, 80, 24);
+    let _snapshot = control.recv().expect("seed snapshot");
+    server.render_and_stream();
+    let _surface = render.recv().expect("pane surface");
+
+    let runtime = server.app.terminal_runtimes.get(&terminal_id).unwrap();
+    let revision = runtime.content_seq();
+
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
+            client_id: 7,
+            boot_id: server.client_shell_boot_id.clone(),
+            request: Box::new(api::schema::Request {
+                id: "act-1".into(),
+                method: api::schema::Method::PaneLinkActivate(api::schema::PaneLinkActivateParams {
+                    pane_id: public_pane_id,
+                    viewport_row: 0,
+                    col: 2,
+                    content_revision: Some(revision),
+                    offset_from_bottom: Some(0),
+                }),
+            }),
+        })
+    );
+    let response_ready = server
+        .server_event_rx
+        .recv()
+        .await
+        .expect("response ready");
+    assert!(!server.handle_server_event(response_ready));
+    let response_bytes = control.recv().expect("response");
+    let msg = read_server_message(response_bytes);
+    let ServerMessage::ClientShellEndpointResponseChunk {
+        request_id,
+        final_chunk,
+        data,
+        ..
+    } = msg
+    else {
+        panic!("expected ClientShellEndpointResponseChunk, got {:?}", msg);
+    };
+    assert_eq!(request_id, "act-1");
+    assert!(final_chunk);
+    let val: serde_json::Value = serde_json::from_slice(&data).unwrap();
+    assert_eq!(val["result"]["url"], "https://example.com");
+    assert_eq!(val["result"]["handled"], false);
+    shutdown_test_runtimes(&mut server);
+}
 
 #[tokio::test]
 async fn deferred_worktree_response_moves_only_its_source_client() {
