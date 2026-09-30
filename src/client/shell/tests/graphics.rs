@@ -90,7 +90,7 @@ fn failed_direct_ack_composition_restores_graphics_for_inline_retry() {
     state.set_pane_surface(pane);
 
     // Model an ACK arriving while projection pairing makes composition unavailable.
-    state.active_snapshot_generation += 1;
+    state.active_snapshot_generation = Some(state.active_snapshot_generation.unwrap_or(0) + 1);
     let image_id = host_image_id(state.graphics_scope(), &key);
     let graphics_before = format!("{:?}", state.graphics);
     let checkpoint = state.direct_graphics_checkpoint();

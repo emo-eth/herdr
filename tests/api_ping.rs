@@ -2446,8 +2446,9 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
     let send_pi = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_status_3","method":"pane.send_text","params":{{"pane_id":"{}","text":"pi"}}}}"#,
-            background_pane_id
+            r#"{{"id":"req_status_3","method":"pane.send_text","params":{{"pane_id":"{}","text":"{}"}}}}"#,
+            background_pane_id,
+            fake_pi.display()
         ),
     );
     assert_eq!(send_pi["result"]["type"], "ok");

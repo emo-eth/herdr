@@ -1963,7 +1963,7 @@ async fn client_shell_pane_link_activate_resolves_and_activates() {
     );
 
     let (control, render) = connect_test_shell(&mut server, 7, 80, 24);
-    let _snapshot = control.recv().expect("seed snapshot");
+    let _snapshot = client_shell_snapshot(&control);
     server.render_and_stream();
     let _surface = render.recv().expect("pane surface");
 
@@ -2583,6 +2583,81 @@ async fn geometry_reapply_replaces_a_controller_that_left_the_tab() {
     );
     shutdown_test_runtimes(&mut server);
 }
+#[tokio::test]
+async fn geometry_reapply_detects_stale_runtimes_when_last_surface_matches() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("stale-geometry");
+    let first_pane = workspace.tabs[0].root_pane;
+    let second_tab = workspace.test_add_tab(Some("second"));
+    let second_pane = workspace.tabs[second_tab].root_pane;
+    for pane_id in [first_pane, second_pane] {
+        workspace.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+    }
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let second_tab_id = server.app.public_tab_id(0, second_tab).unwrap();
+    let public_second_pane_id = server.app.public_pane_id(0, second_pane).unwrap();
+
+    let (first_control, _first_render) = connect_test_shell(&mut server, 67, 100, 30);
+    let (second_control, _second_render) = connect_test_shell(&mut server, 68, 70, 20);
+    let _ = first_control.recv().expect("first snapshot");
+    let _ = second_control.recv().expect("second snapshot");
+    server
+        .clients
+        .get_mut(&68)
+        .unwrap()
+        .render_state
+        .enable_surface_delta(true);
+    // Client 68 views second tab, claims geometry, expires send gate, and renders a baseline surface at 70x20.
+    assert!(server.focus_shell_client_on_tab(68, &second_tab_id));
+    assert!(server.claim_shell_tab_geometry(68, false));
+    if let Some(client) = server.clients.get_mut(&68) {
+        client.last_snapshot_streamed_at = None;
+    }
+    server.render_and_stream();
+    let surface = server.clients[&68]
+        .render_state
+        .last_pane_surface()
+        .expect("client 68 second tab baseline");
+    assert_eq!(surface.panes.len(), 1);
+    assert_eq!(surface.panes[0].pane_id, public_second_pane_id);
+    assert_eq!(surface.panes[0].inner_rect.width, 69);
+    assert_eq!(surface.panes[0].inner_rect.height, 20);
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&second_pane].current_size(),
+        (20, 69)
+    );
+
+    // Client 67 takes over as controller and resizes runtime to 100x30 (inner 99x30).
+    assert!(server.focus_shell_client_on_tab(67, &second_tab_id));
+    assert!(server.claim_shell_tab_geometry(67, false));
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&second_pane].current_size(),
+        (30, 99)
+    );
+
+    // Client 68 re-applies geometry: its last_pane_surface matches 70x20, but the runtime is currently (30, 99).
+    // It must detect the stale runtime, report Some(true), and resize to (20, 69).
+    assert_eq!(
+        server.apply_shell_tab_geometry_with_change(68, false),
+        Some(true)
+    );
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&second_pane].current_size(),
+        (20, 69)
+    );
+    // Repeating the call when runtime already matches now reports Some(false).
+    assert_eq!(
+        server.apply_shell_tab_geometry_with_change(68, false),
+        Some(false)
+    );
+    shutdown_test_runtimes(&mut server);
+}
 
 #[tokio::test]
 async fn client_shell_tabs_render_accept_input_and_resize_independently() {
@@ -2865,6 +2940,9 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
     );
     assert_eq!(location.focused_tab_id(), Some(first_tab_id.as_str()));
 
+    if let Some(client) = server.clients.get_mut(&9) {
+        client.last_snapshot_streamed_at = None;
+    }
     server.render_and_stream();
     let replacement = client_shell_snapshot(&control_rx);
     assert_eq!(

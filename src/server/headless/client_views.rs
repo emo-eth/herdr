@@ -622,6 +622,27 @@ impl HeadlessServer {
             }
             geometry_changed = true;
         } else {
+            let runtime_sizes_before: Vec<(crate::layout::PaneId, (u16, u16))> = self
+                .app
+                .state
+                .workspaces
+                .get(target.workspace_index)
+                .and_then(|workspace| workspace.tabs.get(target.tab_index))
+                .map(|tab| {
+                    tab.panes
+                        .keys()
+                        .filter_map(|&pane_id| {
+                            let rt = self.app.state.runtime_for_pane_in_workspace(
+                                &self.app.terminal_runtimes,
+                                target.workspace_index,
+                                pane_id,
+                            )?;
+                            Some((pane_id, rt.current_size()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let layout = crate::ui::compute_tab_surface_for(
                 &self.app.state,
                 &self.app.terminal_runtimes,
@@ -630,6 +651,20 @@ impl HeadlessServer {
                 true,
                 cell_size,
             );
+
+            let runtimes_resized =
+                runtime_sizes_before
+                    .into_iter()
+                    .any(|(pane_id, size_before)| {
+                        self.app
+                            .state
+                            .runtime_for_pane_in_workspace(
+                                &self.app.terminal_runtimes,
+                                target.workspace_index,
+                                pane_id,
+                            )
+                            .is_some_and(|rt| rt.current_size() != size_before)
+                    });
             if let Some(last_surface) = client.render_state.last_pane_surface() {
                 let mut layout_damaged = false;
                 if last_surface.panes.len() != layout.pane_infos.len()
@@ -674,7 +709,9 @@ impl HeadlessServer {
                         }
                     }
                 }
-                geometry_changed |= layout_damaged;
+                geometry_changed |= layout_damaged || runtimes_resized;
+            } else {
+                geometry_changed = true;
             }
         }
         if self
@@ -722,13 +759,19 @@ impl HeadlessServer {
         for viewers in viewed_tabs.values_mut() {
             viewers.sort_unstable();
         }
+        let mut transferred_controllers = HashSet::new();
         for (tab_id, viewers) in viewed_tabs {
             let controller_is_viewing = self
                 .tab_geometry_controllers
                 .get(&tab_id)
                 .is_some_and(|controller| viewers.contains(controller));
             if !controller_is_viewing {
-                self.tab_geometry_controllers.insert(tab_id, viewers[0]);
+                let prev = self
+                    .tab_geometry_controllers
+                    .insert(tab_id.clone(), viewers[0]);
+                if prev.is_some_and(|prev_id| prev_id != viewers[0]) {
+                    transferred_controllers.insert(tab_id);
+                }
             }
         }
 
@@ -757,10 +800,11 @@ impl HeadlessServer {
         controlled_tabs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         let mut any_applied = false;
         let mut any_geometry_changed = false;
-        for (_, client_id, target) in controlled_tabs {
+        for (tab_id, client_id, target) in controlled_tabs {
             if let Some(changed) = self.resize_shell_tab_geometry_to_target(client_id, target) {
                 any_applied = true;
-                any_geometry_changed = changed || any_geometry_changed;
+                let controller_transferred = transferred_controllers.contains(&tab_id);
+                any_geometry_changed = changed || controller_transferred || any_geometry_changed;
             }
         }
         if any_applied {
