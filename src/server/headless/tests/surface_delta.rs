@@ -347,3 +347,96 @@ async fn retained_v2_graphics_stay_on_the_v2_codec() {
     assert!(text_baseline.graphics.assets.is_empty());
     shutdown_test_runtimes(&mut server);
 }
+
+#[tokio::test]
+async fn moved_or_cropped_placement_emits_graphics_delta() {
+    let (mut server, _control_rx, render_rx, pane_id) =
+        retained_test_server_with_control(b"text before image");
+    server.clients.get_mut(&1).unwrap().cell_size = crate::kitty_graphics::HostCellSize {
+        width_px: 10,
+        height_px: 20,
+    };
+    enable_v2(&mut server, 1);
+    server.render_and_stream();
+    let _ = receive_message(&render_rx);
+
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=1,r=1,q=2;/wAA/w==\x1b\\",
+    );
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    let (_, _image_message) = receive_message(&render_rx);
+    let image_baseline = server.clients[&1]
+        .render_state
+        .last_pane_surface()
+        .expect("image baseline")
+        .clone();
+    assert_eq!(image_baseline.graphics.placements.len(), 1);
+    assert_eq!(image_baseline.graphics.placements[0].cols, 1);
+
+    write_shared_test_pane(&mut server, pane_id, b"\x1b_Ga=p,i=7,p=3,c=2,r=1,q=2\x1b\\");
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    let (_, move_message) = receive_message(&render_rx);
+    assert!(
+        matches!(
+            &move_message,
+            ServerMessage::EndpointControl { kind, .. }
+                if kind == crate::protocol::delta::SURFACE_CODEC_DELTA_V2
+        ),
+        "moved placement must emit a v2 delta message"
+    );
+    let updated_baseline = server.clients[&1]
+        .render_state
+        .last_pane_surface()
+        .expect("updated baseline");
+    assert_eq!(updated_baseline.graphics.placements.len(), 1);
+    assert_eq!(updated_baseline.graphics.placements[0].cols, 2);
+
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\r\n\x1b_Ga=p,i=7,p=3,c=2,r=2,q=2\x1b\\",
+    );
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    let (_, move_message) = receive_message(&render_rx);
+    assert!(
+        matches!(
+            &move_message,
+            ServerMessage::EndpointControl { kind, .. }
+                if kind == crate::protocol::delta::SURFACE_CODEC_DELTA_V2
+        ),
+        "moved placement must emit a v2 delta message"
+    );
+    let moved_baseline = server.clients[&1]
+        .render_state
+        .last_pane_surface()
+        .expect("moved baseline");
+    assert_eq!(moved_baseline.graphics.placements.len(), 1);
+    assert_eq!(moved_baseline.graphics.placements[0].y, 1);
+    assert_eq!(moved_baseline.graphics.placements[0].rows, 2);
+
+    // Moving the cursor and re-placing at a different screen coordinate moves y
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\x1b[5;1H\x1b_Ga=p,i=7,p=3,c=2,r=2,q=2\x1b\\",
+    );
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    let (_, move_message2) = receive_message(&render_rx);
+    assert!(
+        matches!(
+            &move_message2,
+            ServerMessage::EndpointControl { kind, .. }
+                if kind == crate::protocol::delta::SURFACE_CODEC_DELTA_V2
+        ),
+        "moved placement must emit a v2 delta message"
+    );
+    let moved2_baseline = server.clients[&1]
+        .render_state
+        .last_pane_surface()
+        .expect("moved2 baseline");
+    assert_eq!(moved2_baseline.graphics.placements.len(), 1);
+    assert_eq!(moved2_baseline.graphics.placements[0].y, 4);
+    shutdown_test_runtimes(&mut server);
+}

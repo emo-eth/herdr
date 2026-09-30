@@ -1695,6 +1695,17 @@
           ],
           "type": "object"
         },
+        "ClientClipboardSetParams": {
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
         "ClientShellSurfaceSetParams": {
           "description": "Updates whether the requesting client shell receives and controls pane presentation.",
           "properties": {
@@ -4881,6 +4892,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "client.clipboard.set",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ClientClipboardSetParams"
             }
           },
           "required": [
@@ -10006,6 +10033,22 @@
                 "type",
                 "changed",
                 "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delivered": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "client_clipboard_set",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delivered"
               ],
               "type": "object"
             },

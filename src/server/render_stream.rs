@@ -699,6 +699,28 @@ fn prepared_legacy_patch_or_v2_delta(
             encoded: None,
         }),
         Err(delta) => {
+            let committed_graphics = delta.graphics.as_ref().map(|gfx_delta| {
+                let mut scene = SurfaceGraphicsScene {
+                    assets: Vec::new(),
+                    placements: last.graphics.placements.clone(),
+                    retained_assets: gfx_delta.retained_assets.clone(),
+                };
+                for rem in &gfx_delta.removed_placements {
+                    scene.placements.retain(|p| {
+                        !(p.asset == rem.asset
+                            && p.logical_placement_id == rem.logical_placement_id)
+                    });
+                }
+                for add in &gfx_delta.added_placements {
+                    scene.placements.push(add.clone());
+                }
+                let queued_assets = gfx_delta
+                    .added_assets
+                    .iter()
+                    .map(|a| a.key.clone())
+                    .collect::<Vec<_>>();
+                (scene, queued_assets)
+            });
             let encoded = crate::protocol::delta::encode_surface_delta(&delta).ok()?;
             let message = ServerMessage::EndpointControl {
                 kind: crate::protocol::delta::SURFACE_CODEC_DELTA_V2.into(),
@@ -714,6 +736,7 @@ fn prepared_legacy_patch_or_v2_delta(
             Some(PreparedRender::SurfaceDelta {
                 message,
                 delta: Box::new(delta),
+                committed_graphics,
             })
         }
     }
@@ -771,23 +794,13 @@ fn graphics_delta(
     let added_placements = next
         .placements
         .iter()
-        .filter(|placement| {
-            last.placements.iter().all(|existing| {
-                existing.asset != placement.asset
-                    || existing.logical_placement_id != placement.logical_placement_id
-            })
-        })
+        .filter(|placement| !last.placements.contains(placement))
         .cloned()
         .collect::<Vec<_>>();
     let removed_placements = last
         .placements
         .iter()
-        .filter(|placement| {
-            next.placements.iter().all(|existing| {
-                existing.asset != placement.asset
-                    || existing.logical_placement_id != placement.logical_placement_id
-            })
-        })
+        .filter(|placement| !next.placements.contains(placement))
         .map(
             |placement| crate::protocol::delta::SurfaceGraphicsPlacementKey {
                 asset: placement.asset.clone(),
@@ -929,6 +942,7 @@ pub(crate) enum PreparedRender {
     SurfaceDelta {
         message: ServerMessage,
         delta: Box<crate::protocol::delta::ClientShellSurfaceDelta>,
+        committed_graphics: Option<(SurfaceGraphicsScene, Vec<SurfaceGraphicsAssetKey>)>,
     },
     TerminalAnsi {
         message: ServerMessage,
@@ -959,6 +973,10 @@ impl PreparedRender {
                 queued_graphics_assets,
                 ..
             } => Some((&committed_surface.graphics, queued_graphics_assets)),
+            Self::SurfaceDelta {
+                committed_graphics: Some((scene, queued_assets)),
+                ..
+            } => Some((scene, queued_assets.as_slice())),
             Self::SemanticPatch { .. } | Self::SurfaceDelta { .. } | Self::TerminalAnsi { .. } => {
                 None
             }
@@ -966,9 +984,18 @@ impl PreparedRender {
     }
 
     pub(crate) fn has_queued_surface_assets(&self) -> bool {
-        matches!(self, Self::Semantic { queued_graphics_assets, .. } if !queued_graphics_assets.is_empty())
+        match self {
+            Self::Semantic {
+                queued_graphics_assets,
+                ..
+            } => !queued_graphics_assets.is_empty(),
+            Self::SurfaceDelta {
+                committed_graphics: Some((_, queued_assets)),
+                ..
+            } => !queued_assets.is_empty(),
+            _ => false,
+        }
     }
-
     /// Removes the largest inline payload from a full semantic surface while
     /// preserving placement metadata. Largest-first guarantees that a fitting
     /// smaller asset is not discarded behind an oversized one. Equal sizes use

@@ -846,6 +846,14 @@ pub(super) struct ClientCopyModeState {
     pub(super) copy_after_search: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneReconcileSnapshot {
+    pub(crate) pane_id: String,
+    pub(crate) inner_rect: crate::protocol::SurfaceRect,
+    pub(crate) alternate_screen_active: bool,
+    pub(crate) content_revision: u64,
+}
+
 pub(crate) struct ClientShellState {
     pub(super) machine_diagnostics: super::machine_diagnostics::MachineDiagnostics,
     pub(super) config: ClientShellConfig,
@@ -1676,10 +1684,42 @@ impl ClientShellState {
         if surface.projection_revision != snapshot.revision {
             self.hits = ShellHitMap::default();
         }
-        self.unpresented_damage.clear();
-        self.acknowledge_active_surface_agents(&surface);
+        let previous_panes = self
+            .pane_surface
+            .as_ref()
+            .map(|s| {
+                s.panes
+                    .iter()
+                    .map(|p| PaneReconcileSnapshot {
+                        pane_id: p.pane_id.clone(),
+                        inner_rect: p.inner_rect,
+                        alternate_screen_active: p.alternate_screen_active,
+                        content_revision: p.content_revision,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let previous_popup = self.popup_terminal_id.clone();
-        let next_popup = surface
+
+        self.unpresented_damage.clear();
+        self.reconcile_pane_surface_state(&previous_panes, previous_popup, &surface);
+
+        self.graphics
+            .set_scene(std::mem::take(&mut surface.graphics));
+        self.pane_surface = Some(surface);
+        self.pane_surface_generation = self.active_snapshot_generation;
+        self.surface_resync_pending = false;
+        self.resume_mobile_switcher_if_ready();
+    }
+
+    pub(crate) fn reconcile_pane_surface_state(
+        &mut self,
+        previous_panes: &[PaneReconcileSnapshot],
+        previous_popup: Option<String>,
+        next_surface: &PaneSurfaceFrame,
+    ) {
+        self.acknowledge_active_surface_agents(next_surface);
+        let next_popup = next_surface
             .popup
             .as_deref()
             .map(|popup| popup.terminal_id.clone());
@@ -1727,19 +1767,18 @@ impl ClientShellState {
             self.popup_pending = false;
             self.popup_pending_deadline = None;
         }
+        self.popup_terminal_id = next_popup;
+
         let selection_pane = match &self.word_selection_gesture {
             Some(gesture) => Some(&gesture.pane_id),
             None => self.selection.as_ref().map(|selection| &selection.pane_id),
         };
         let selection_invalidated = selection_pane.is_some_and(|pane_id| {
-            let Some(previous_surface) = self.pane_surface.as_ref() else {
-                return false;
-            };
-            let previous = previous_surface
+            let previous = previous_panes.iter().find(|pane| &pane.pane_id == pane_id);
+            let next = next_surface
                 .panes
                 .iter()
                 .find(|pane| &pane.pane_id == pane_id);
-            let next = surface.panes.iter().find(|pane| &pane.pane_id == pane_id);
             let (Some(previous), Some(next)) = (previous, next) else {
                 return false;
             };
@@ -1758,7 +1797,7 @@ impl ClientShellState {
             self.stop_selection_autoscroll();
             self.selection_highlight_clear_deadline = None;
         }
-        for pane in &surface.panes {
+        for pane in &next_surface.panes {
             let Some(target) = self.pane_scroll_targets.get(&pane.pane_id).copied() else {
                 continue;
             };
@@ -1773,7 +1812,7 @@ impl ClientShellState {
         }
         let mut invalidated_copy_pane = None;
         if let Some(copy_mode) = self.copy_mode.as_mut() {
-            if let Some(pane) = surface
+            if let Some(pane) = next_surface
                 .panes
                 .iter()
                 .find(|pane| pane.pane_id == copy_mode.pane_id)
@@ -1816,17 +1855,9 @@ impl ClientShellState {
             self.stop_selection_autoscroll();
             self.selection_highlight_clear_deadline = None;
         }
-        self.popup_terminal_id = next_popup;
-        self.graphics
-            .set_scene(std::mem::take(&mut surface.graphics));
-        self.pane_surface = Some(surface);
-        self.pane_surface_generation = self.active_snapshot_generation;
-        self.surface_resync_pending = false;
         self.invalidate_link_hover();
-        self.resume_mobile_switcher_if_ready();
         self.reconcile_input_source();
     }
-
     pub(crate) fn apply_surface_delta(
         &mut self,
         delta: crate::protocol::delta::ClientShellSurfaceDelta,

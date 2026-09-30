@@ -295,26 +295,35 @@ impl ClientShellState {
         {
             return ClientPaneSurfacePatchOutcome::Rejected;
         }
+        let previous_panes = current
+            .panes
+            .iter()
+            .map(|p| crate::client::shell::state::PaneReconcileSnapshot {
+                pane_id: p.pane_id.clone(),
+                inner_rect: p.inner_rect,
+                alternate_screen_active: p.alternate_screen_active,
+                content_revision: p.content_revision,
+            })
+            .collect::<Vec<_>>();
+        let previous_popup = self.popup_terminal_id.clone();
 
-        let Some(surface) = self.pane_surface.as_mut() else {
-            return ClientPaneSurfacePatchOutcome::Rejected;
-        };
-        if delta.validate(surface, self.graphics.scene()).is_err() {
+        let mut surface = self.pane_surface.take().unwrap();
+        if delta.validate(&surface, self.graphics.scene()).is_err() {
+            self.pane_surface = Some(surface);
             return ClientPaneSurfacePatchOutcome::Rejected;
         }
-        if delta.apply_to(surface, self.graphics.scene_mut()).is_err() {
+        if delta
+            .apply_to(&mut surface, self.graphics.scene_mut())
+            .is_err()
+        {
+            self.pane_surface = Some(surface);
             return ClientPaneSurfacePatchOutcome::Rejected;
         }
         if let Some(gfx_delta) = &delta.graphics {
             self.graphics.update_resident_assets(gfx_delta);
         }
-        self.popup_terminal_id = self.pane_surface.as_ref().and_then(|surface| {
-            surface
-                .popup
-                .as_deref()
-                .map(|popup| popup.terminal_id.clone())
-        });
-
+        self.reconcile_pane_surface_state(&previous_panes, previous_popup, &surface);
+        self.pane_surface = Some(surface);
         let popup_visible = self
             .pane_surface
             .as_ref()

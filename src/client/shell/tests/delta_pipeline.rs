@@ -584,3 +584,154 @@ fn v2_cell_delta_does_not_blit_through_an_unchanged_popup() {
         crate::client::shell::surface_patch::ClientPaneSurfacePatchOutcome::Applied(None)
     ));
 }
+#[test]
+fn v2_surface_delta_reconciles_copy_mode_selection_and_scroll_targets() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+
+    let mut initial_surface = surface();
+    initial_surface.projection_revision = 1;
+    initial_surface.surface_revision = 10;
+    initial_surface.panes[0].content_revision = 100;
+    initial_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 50,
+        viewport_rows: 24,
+    });
+    state.set_pane_surface(initial_surface.clone());
+    let _ = state.compose(100, 30).expect("initial compose");
+
+    // 1. Enter copy mode on pane_1 with content_revision 100 and a search match
+    state.mode = ClientShellMode::Copy;
+    state.copy_mode = Some(ClientCopyModeState {
+        pane_id: "pane_1".into(),
+        content_revision: 100,
+        geometry: (80, 24),
+        alternate_screen_active: false,
+        cursor: crate::api::schema::PaneTextPoint { row: 0, col: 0 },
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 50,
+        entry_offset_from_bottom: 0,
+        selection: None,
+        search_prompt: None,
+        search_query: "needle".into(),
+        search_direction: Some(crate::api::schema::PaneCopySearchDirection::Forward),
+        search_matches: vec![crate::api::schema::PaneTextRange {
+            start: crate::api::schema::PaneTextPoint { row: 0, col: 0 },
+            end: crate::api::schema::PaneTextPoint { row: 0, col: 6 },
+        }],
+        search_total: 1,
+        search_current: Some(0),
+        search_current_global: Some(0),
+        search_generation: 1,
+        copy_after_search: false,
+    });
+
+    // 2. Set an active scroll target for pane_1
+    state.pane_scroll_targets.insert("pane_1".into(), 10);
+
+    // 3. Set an active word selection gesture on pane_1
+    let mut outcome = ClientShellInput::default();
+    let hit = state.hits.panes[0].clone();
+    state.request_word_selection(&hit, 0, 2, &mut outcome);
+    assert!(state.word_selection_gesture.is_some());
+    state.selection = Some(crate::selection::Selection::absolute_range(
+        "pane_1".into(),
+        (0, 0),
+        (0, 4),
+    ));
+
+    let mut next_pane = initial_surface.panes[0].clone();
+    next_pane.content_revision = 101;
+    next_pane.scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 10,
+        max_offset_from_bottom: 50,
+        viewport_rows: 24,
+    });
+    let pane_delta = PaneSurfacePaneDelta::diff(&initial_surface.panes[0], &next_pane).unwrap();
+
+    // 4. Apply a v2 surface delta with updated content_revision (101) and scroll offset reaching the target (10)
+    let delta = ClientShellSurfaceDelta {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        base_surface_revision: 10,
+        surface_revision: 11,
+        spans: vec![PaneSurfacePatchRow {
+            x: 0,
+            y: 0,
+            cells: vec![cell_with_symbol("N")],
+        }],
+        row_moves: Vec::new(),
+        panes: vec![pane_delta],
+        splits: None,
+        cursor: SurfaceFieldUpdate::Unchanged,
+        appended_hyperlinks: Vec::new(),
+        graphics: None,
+        popup: None,
+    };
+
+    assert!(matches!(
+        state.apply_surface_delta(delta),
+        crate::client::shell::surface_patch::ClientPaneSurfacePatchOutcome::Applied(_)
+    ));
+
+    // Acknowledged scroll target must be cleared
+    assert_eq!(state.pane_scroll_targets.get("pane_1"), None);
+
+    // Obsolete word selection gesture and selection must be cleared on content change
+    assert!(state.word_selection_gesture.is_none());
+    assert!(state.selection.is_none());
+
+    // Copy mode state must be updated to the new revision, stale search cleared, search_generation bumped
+    let copy = state.copy_mode.as_ref().expect("copy mode active");
+    assert_eq!(copy.content_revision, 101);
+    assert_eq!(copy.search_matches, Vec::new());
+    assert_eq!(copy.search_total, 0);
+    assert_eq!(copy.search_generation, 2);
+
+    // A stale search result for the old revision 100 or old generation 1 must be rejected
+    let mut search_outcome = ClientShellInput::default();
+    let stale_result = ClientCopySearchResult {
+        content_revision: 100,
+        matches: vec![crate::api::schema::PaneTextRange {
+            start: crate::api::schema::PaneTextPoint { row: 0, col: 0 },
+            end: crate::api::schema::PaneTextPoint { row: 0, col: 6 },
+        }],
+        total: 1,
+        current: Some(0),
+        current_global: Some(0),
+    };
+    assert!(!state.apply_copy_search_result(
+        "pane_1",
+        crate::api::schema::PaneTextPoint { row: 0, col: 0 },
+        "needle".into(),
+        crate::api::schema::PaneCopySearchDirection::Forward,
+        false,
+        1,
+        stale_result,
+        &mut search_outcome,
+    ));
+
+    // A current search result for revision 101 and generation 2 must be accepted
+    let fresh_result = ClientCopySearchResult {
+        content_revision: 101,
+        matches: vec![crate::api::schema::PaneTextRange {
+            start: crate::api::schema::PaneTextPoint { row: 0, col: 0 },
+            end: crate::api::schema::PaneTextPoint { row: 0, col: 6 },
+        }],
+        total: 1,
+        current: Some(0),
+        current_global: Some(0),
+    };
+    assert!(state.apply_copy_search_result(
+        "pane_1",
+        crate::api::schema::PaneTextPoint { row: 0, col: 0 },
+        "needle".into(),
+        crate::api::schema::PaneCopySearchDirection::Forward,
+        false,
+        2,
+        fresh_result,
+        &mut search_outcome,
+    ));
+    assert_eq!(state.copy_mode.as_ref().unwrap().search_total, 1);
+}

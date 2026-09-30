@@ -149,7 +149,9 @@ fn api_request(socket: &Path, request: &str) -> Value {
 fn create_pane(socket: &Path, label: &str) -> String {
     let result = api_request(
         socket,
-        &format!(r#"{{"id":"create","method":"workspace.create","params":{{"label":"{label}"}}}}"#),
+        &format!(
+            r#"{{"id":"create","method":"workspace.create","params":{{"label":"{label}","focus":true}}}}"#
+        ),
     );
     assert!(
         result.get("error").is_none(),
