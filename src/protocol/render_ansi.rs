@@ -935,6 +935,9 @@ fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
     }
 
     close_hyperlink(writer, &mut active_hyperlink);
+
+    // Reset style at the end.
+    let _ = writer.write_all(b"\x1b[0m");
 }
 
 fn cell_hyperlink_uri_with_appended<'a>(

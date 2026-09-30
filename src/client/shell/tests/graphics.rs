@@ -90,7 +90,7 @@ fn failed_direct_ack_composition_restores_graphics_for_inline_retry() {
     state.set_pane_surface(pane);
 
     // Model an ACK arriving while projection pairing makes composition unavailable.
-    state.pending_pane_surface = Some(surface());
+    state.active_snapshot_generation += 1;
     let image_id = host_image_id(state.graphics_scope(), &key);
     let graphics_before = format!("{:?}", state.graphics);
     let checkpoint = state.direct_graphics_checkpoint();
@@ -100,7 +100,7 @@ fn failed_direct_ack_composition_restores_graphics_for_inline_retry() {
     assert_eq!(format!("{:?}", state.graphics), graphics_before);
 
     // Once pairing is available, fallback still owns the asset and uploads it normally.
-    state.pending_pane_surface = None;
+    state.active_snapshot_generation = state.pane_surface_generation;
     let retry = state.compose(106, 20).expect("fallback frame");
     assert!(String::from_utf8_lossy(&retry.graphics.into_inline_bytes()).contains("a=t"));
 }
