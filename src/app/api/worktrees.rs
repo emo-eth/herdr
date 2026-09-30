@@ -2690,24 +2690,32 @@ mod tests {
             ],
         );
 
-        let mut app = app_with_parent(&repo);
-        let second_tab = app.state.workspaces[0].test_add_tab(Some("second"));
-        app.state.workspaces[0].active_tab = second_tab;
-        let original_pane = app.state.workspaces[0].tabs[second_tab].layout.focused();
+        let event_hub = crate::api::EventHub::default();
+        let mut app = test_app_with_event_hub(event_hub.clone());
+        let mut parent = Workspace::test_new("main");
+        parent.identity_cwd = repo.clone();
+        let parent_workspace_id = parent.id.clone();
+        let second_tab = parent.test_add_tab(Some("second"));
+        parent.active_tab = second_tab;
+        let original_pane = parent.tabs[second_tab].layout.focused();
+        app.state.workspaces = vec![parent];
+        app.state.ensure_test_terminals();
         app.state.active = None;
         app.state.selected = 0;
         app.state.mode = crate::app::Mode::Navigate;
 
-        let response = app.handle_api_request(Request {
-            id: "req-nofocus-none".into(),
-            method: crate::api::schema::Method::WorktreeOpen(WorktreeOpenParams {
-                workspace_id: Some(app.state.workspaces[0].id.clone()),
-                path: Some(checkout.display().to_string()),
-                focus: false,
-                ..WorktreeOpenParams::default()
-            }),
-        });
-
+        let response = run_deferred_api_request(
+            &mut app,
+            Request {
+                id: "req-nofocus-none".into(),
+                method: crate::api::schema::Method::WorktreeOpen(WorktreeOpenParams {
+                    workspace_id: Some(parent_workspace_id),
+                    path: Some(checkout.display().to_string()),
+                    focus: false,
+                    ..WorktreeOpenParams::default()
+                }),
+            },
+        );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert!(matches!(
             success.result,
@@ -2745,7 +2753,8 @@ mod tests {
             ],
         );
 
-        let mut app = test_app();
+        let event_hub = crate::api::EventHub::default();
+        let mut app = test_app_with_event_hub(event_hub.clone());
         let mut unrelated = Workspace::test_new("unrelated");
         let second_tab = unrelated.test_add_tab(Some("second"));
         unrelated.active_tab = second_tab;
@@ -2756,15 +2765,18 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = crate::app::Mode::Navigate;
 
-        let response = app.handle_api_request(Request {
-            id: "req-source-parent".into(),
-            method: crate::api::schema::Method::WorktreeOpen(WorktreeOpenParams {
-                cwd: Some(repo.display().to_string()),
-                path: Some(checkout.display().to_string()),
-                focus: false,
-                ..WorktreeOpenParams::default()
-            }),
-        });
+        let response = run_deferred_api_request(
+            &mut app,
+            Request {
+                id: "req-source-parent".into(),
+                method: crate::api::schema::Method::WorktreeOpen(WorktreeOpenParams {
+                    cwd: Some(repo.display().to_string()),
+                    path: Some(checkout.display().to_string()),
+                    focus: false,
+                    ..WorktreeOpenParams::default()
+                }),
+            },
+        );
 
         let success: SuccessResponse = serde_json::from_str(&response).unwrap_or_else(|err| {
             panic!("expected success response, got {response}: {err}");
