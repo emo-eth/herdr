@@ -1702,13 +1702,14 @@ impl ClientShellState {
         let previous_popup = self.popup_terminal_id.clone();
 
         self.unpresented_damage.clear();
-        self.reconcile_pane_surface_state(&previous_panes, previous_popup, &surface);
+        let _ = self.reconcile_pane_surface_state(&previous_panes, previous_popup, &surface);
 
         self.graphics
             .set_scene(std::mem::take(&mut surface.graphics));
         self.pane_surface = Some(surface);
         self.pane_surface_generation = self.active_snapshot_generation;
         self.surface_resync_pending = false;
+        self.invalidate_link_hover();
         self.resume_mobile_switcher_if_ready();
     }
 
@@ -1717,7 +1718,8 @@ impl ClientShellState {
         previous_panes: &[PaneReconcileSnapshot],
         previous_popup: Option<String>,
         next_surface: &PaneSurfaceFrame,
-    ) {
+    ) -> bool {
+        let had_selection = self.selection.is_some() || self.word_selection_gesture.is_some();
         self.acknowledge_active_surface_agents(next_surface);
         let next_popup = next_surface
             .popup
@@ -1855,8 +1857,8 @@ impl ClientShellState {
             self.stop_selection_autoscroll();
             self.selection_highlight_clear_deadline = None;
         }
-        self.invalidate_link_hover();
         self.reconcile_input_source();
+        had_selection && (self.selection.is_none() && self.word_selection_gesture.is_none())
     }
     pub(crate) fn apply_surface_delta(
         &mut self,

@@ -263,6 +263,101 @@ fn ctrl_hover_preserves_fast_patches_for_other_panes() {
     ));
     assert!(!state.link_hover.as_ref().unwrap().regions.is_empty());
 }
+#[test]
+fn ctrl_hover_preserves_fast_delta_for_unrelated_pane() {
+    let mut state = hover_state();
+    let mut next = surface();
+    next.surface_revision = 2;
+    next.frame.height = 4;
+    next.frame.cells.extend(next.frame.cells.clone());
+    let mut other = next.panes[0].clone();
+    other.pane_id = "pane_2".into();
+    other.rect.y = 2;
+    other.inner_rect.y = 2;
+    next.panes.push(other.clone());
+    state.set_pane_surface(next);
+    state.compose(106, 20).unwrap();
+    let mouse = hover_mouse(&state, 1, 0);
+    let id = hover_request(&state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]));
+    assert!(resolve_hover(&mut state, &id));
+    state.compose(106, 20).unwrap();
+
+    let mut next_other = other.clone();
+    next_other.content_revision = 2;
+    let pane_delta =
+        crate::protocol::delta::PaneSurfacePaneDelta::diff(&other, &next_other).unwrap();
+    let delta = crate::protocol::delta::ClientShellSurfaceDelta {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        base_surface_revision: 2,
+        surface_revision: 3,
+        spans: vec![crate::protocol::PaneSurfacePatchRow {
+            x: 0,
+            y: 2,
+            cells: vec![surface().frame.cells[0].clone()],
+        }],
+        row_moves: Vec::new(),
+        panes: vec![pane_delta],
+        splits: None,
+        cursor: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+        appended_hyperlinks: Vec::new(),
+        graphics: None,
+        popup: None,
+    };
+    assert!(matches!(
+        state.apply_surface_delta(delta),
+        ClientPaneSurfacePatchOutcome::Applied(Some(_))
+    ));
+    assert!(!state.link_hover.as_ref().unwrap().regions.is_empty());
+}
+
+#[test]
+fn ctrl_hover_relevant_pane_delta_removes_old_underlines() {
+    let mut state = hover_state();
+    let mouse = hover_mouse(&state, 1, 0);
+    let id = hover_request(&state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]));
+    assert!(resolve_hover(&mut state, &id));
+    state.compose(106, 20).unwrap();
+    assert!(!state.link_hover.as_ref().unwrap().regions.is_empty());
+
+    let initial_pane = state.pane_surface.as_ref().unwrap().panes[0].clone();
+    let mut next_pane = initial_pane.clone();
+    next_pane.content_revision = 2;
+    let pane_delta =
+        crate::protocol::delta::PaneSurfacePaneDelta::diff(&initial_pane, &next_pane).unwrap();
+    let delta = crate::protocol::delta::ClientShellSurfaceDelta {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        base_surface_revision: 1,
+        surface_revision: 2,
+        spans: vec![crate::protocol::PaneSurfacePatchRow {
+            x: 0,
+            y: 0,
+            cells: vec![surface().frame.cells[0].clone()],
+        }],
+        row_moves: Vec::new(),
+        panes: vec![pane_delta],
+        splits: None,
+        cursor: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
+        appended_hyperlinks: Vec::new(),
+        graphics: None,
+        popup: None,
+    };
+    assert!(matches!(
+        state.apply_surface_delta(delta),
+        ClientPaneSurfacePatchOutcome::Applied(None)
+    ));
+    assert!(state.link_hover.is_none());
+    let frame = state.compose(106, 20).unwrap();
+    let pane = &state.hits.panes[0];
+    for row in 0..2 {
+        for col in 0..4 {
+            let idx = usize::from(pane.inner_rect.y + row) * usize::from(frame.width)
+                + usize::from(pane.inner_rect.x + col);
+            assert_eq!(frame.cells[idx].modifier & Modifier::UNDERLINED.bits(), 0);
+        }
+    }
+}
 
 #[test]
 fn ctrl_hover_ignores_late_reply_after_pointer_leaves() {

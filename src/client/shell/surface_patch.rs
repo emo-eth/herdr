@@ -322,8 +322,10 @@ impl ClientShellState {
         if let Some(gfx_delta) = &delta.graphics {
             self.graphics.update_resident_assets(gfx_delta);
         }
-        self.reconcile_pane_surface_state(&previous_panes, previous_popup, &surface);
+        let selection_cleared =
+            self.reconcile_pane_surface_state(&previous_panes, previous_popup, &surface);
         self.pane_surface = Some(surface);
+        let hover_cleared = self.invalidate_link_hover();
         let popup_visible = self
             .pane_surface
             .as_ref()
@@ -331,10 +333,12 @@ impl ClientShellState {
         if delta.popup.is_some()
             || delta.graphics.is_some()
             || popup_visible
+            || selection_cleared
+            || hover_cleared
             || self.link_hover_blocks_delta(&delta)
             || client_local_overlay_blocks_direct_blit(self).is_some()
         {
-            // Popup, graphics, link hover, and local overlays require compose rather than a cell blit.
+            // Popup, graphics, link hover, selection invalidation, and local overlays require compose rather than a cell blit.
             return ClientPaneSurfacePatchOutcome::Applied(None);
         }
 

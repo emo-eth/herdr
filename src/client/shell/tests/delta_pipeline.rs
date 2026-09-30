@@ -735,3 +735,84 @@ fn v2_surface_delta_reconciles_copy_mode_selection_and_scroll_targets() {
     ));
     assert_eq!(state.copy_mode.as_ref().unwrap().search_total, 1);
 }
+
+#[test]
+fn v2_surface_delta_in_terminal_mode_clears_word_selection_and_removes_highlighting() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+
+    let mut initial_surface = surface();
+    initial_surface.projection_revision = 1;
+    initial_surface.surface_revision = 10;
+    initial_surface.panes[0].content_revision = 100;
+    state.set_pane_surface(initial_surface.clone());
+    let initial_frame = state.compose(100, 30).expect("initial compose");
+
+    // In Terminal mode, start a word selection on pane_1 covering cells 0..4
+    assert_eq!(state.mode, ClientShellMode::Terminal);
+    let mut outcome = ClientShellInput::default();
+    let hit = state.hits.panes[0].clone();
+    state.request_word_selection(&hit, 0, 2, &mut outcome);
+    assert!(state.word_selection_gesture.is_some());
+    state.selection = Some(crate::selection::Selection::absolute_range(
+        "pane_1".into(),
+        (0, 0),
+        (0, 4),
+    ));
+
+    // Compose with selection active: cells 0..4 should have selection highlighting
+    let frame_with_selection = state.compose(100, 30).expect("compose with selection");
+    let cell_idx = |col: u16, row: u16| {
+        usize::from(hit.inner_rect.y + row) * usize::from(frame_with_selection.width)
+            + usize::from(hit.inner_rect.x + col)
+    };
+    // Cell (2, 0) should have selection highlighting distinct from the unselected initial frame
+    assert_ne!(
+        frame_with_selection.cells[cell_idx(2, 0)].bg,
+        initial_frame.cells[cell_idx(2, 0)].bg
+    );
+
+    // Apply a v2 surface delta with updated content revision (101), but only a 1-cell span update at x=0
+    let mut next_pane = initial_surface.panes[0].clone();
+    next_pane.content_revision = 101;
+    let pane_delta = PaneSurfacePaneDelta::diff(&initial_surface.panes[0], &next_pane).unwrap();
+    let delta = ClientShellSurfaceDelta {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        base_surface_revision: 10,
+        surface_revision: 11,
+        spans: vec![PaneSurfacePatchRow {
+            x: 0,
+            y: 0,
+            cells: vec![cell_with_symbol("N")],
+        }],
+        row_moves: Vec::new(),
+        panes: vec![pane_delta],
+        splits: None,
+        cursor: SurfaceFieldUpdate::Unchanged,
+        appended_hyperlinks: Vec::new(),
+        graphics: None,
+        popup: None,
+    };
+    let patch_outcome = state.apply_surface_delta(delta);
+    assert!(
+        matches!(
+            patch_outcome,
+            crate::client::shell::surface_patch::ClientPaneSurfacePatchOutcome::Applied(None)
+        ),
+        "cleared selection decoration must force composition rather than direct-blitting a partial span"
+    );
+    // Both word selection gesture and selection must be cleared
+    assert!(state.word_selection_gesture.is_none());
+    assert!(state.selection.is_none());
+    let composed_frame = state.compose(100, 30).expect("compose after delta");
+    assert_eq!(
+        composed_frame.cells[cell_idx(2, 0)].bg,
+        initial_frame.cells[cell_idx(2, 0)].bg,
+        "selection styling must be completely removed from previously highlighted cells"
+    );
+    assert_eq!(
+        composed_frame.cells[cell_idx(2, 0)].fg,
+        initial_frame.cells[cell_idx(2, 0)].fg,
+    );
+}
