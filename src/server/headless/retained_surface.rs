@@ -496,8 +496,6 @@ impl HeadlessServer {
                     fallback!("graphics_target");
                 };
                 let client = &self.clients[&client_id];
-                let mut next_surface = surface.clone();
-                crate::server::render_stream::apply_pane_surface_patch(&mut next_surface, &patch);
                 let Some((graphics, delivery, sources)) =
                     crate::server::client_shell_graphics::collect_retained(
                         &self.app,
