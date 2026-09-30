@@ -850,10 +850,9 @@ impl HeadlessServer {
                     if is_v2 {
                         client.render_state.prepare_pane_surface_v2(candidate)
                     } else {
-                        client.render_state.prepare_pane_surface_with_file(
-                            candidate,
-                            native_upload.is_some(),
-                        )
+                        client
+                            .render_state
+                            .prepare_pane_surface_with_file(candidate, native_upload.is_some())
                     }
                 } else {
                     client.render_state.prepare_frame(frame)

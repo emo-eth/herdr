@@ -723,7 +723,12 @@ fn seed_full_pane_surface(surface_revision: &u64, mut surface: PaneSurfaceFrame)
     surface.surface_revision = surface_revision.saturating_add(1);
     let mut committed_surface = surface.clone();
     committed_surface.graphics.assets.clear();
-    let queued_graphics_assets = surface.graphics.assets.iter().map(|a| a.key.clone()).collect();
+    let queued_graphics_assets = surface
+        .graphics
+        .assets
+        .iter()
+        .map(|a| a.key.clone())
+        .collect();
     PreparedRender::Semantic {
         message: ServerMessage::PaneSurface(surface),
         committed_surface: Box::new(committed_surface),
@@ -954,9 +959,9 @@ impl PreparedRender {
                 queued_graphics_assets,
                 ..
             } => Some((&committed_surface.graphics, queued_graphics_assets)),
-            Self::SemanticPatch { .. }
-            | Self::SurfaceDelta { .. }
-            | Self::TerminalAnsi { .. } => None,
+            Self::SemanticPatch { .. } | Self::SurfaceDelta { .. } | Self::TerminalAnsi { .. } => {
+                None
+            }
         }
     }
 

@@ -864,33 +864,34 @@ pub(crate) fn handle_client_handshake(
     } else {
         RenderEncoding::TerminalAnsi
     };
-    let welcome = if let Some((_, _, _, _, _, _, _, surface_scroll, ref snap_codec, ref surf_codec)) =
-        shell_options
-    {
-        let mut welcome = EndpointServerWelcome::compatible(
-            crate::server::client_commands::supported_client_shell_method_names()
-                .iter()
-                .map(|method| (*method).to_owned())
-                .collect(),
-        );
-        if !surface_scroll {
-            welcome
-                .capabilities
-                .retain(|c| c != crate::protocol::surface_scroll::CAPABILITY);
-        }
-        welcome.snapshot_codec = snap_codec.clone();
-        welcome.surface_codec = surf_codec.clone();
-        ServerMessage::EndpointControl {
-            kind: ENDPOINT_WELCOME_KIND.into(),
-            data: serde_json::to_string(&welcome).map_err(io::Error::other)?,
-        }
-    } else {
-        ServerMessage::Welcome {
-            version: PROTOCOL_VERSION,
-            encoding: render_encoding,
-            error: None,
-        }
-    };
+    let welcome =
+        if let Some((_, _, _, _, _, _, _, surface_scroll, ref snap_codec, ref surf_codec)) =
+            shell_options
+        {
+            let mut welcome = EndpointServerWelcome::compatible(
+                crate::server::client_commands::supported_client_shell_method_names()
+                    .iter()
+                    .map(|method| (*method).to_owned())
+                    .collect(),
+            );
+            if !surface_scroll {
+                welcome
+                    .capabilities
+                    .retain(|c| c != crate::protocol::surface_scroll::CAPABILITY);
+            }
+            welcome.snapshot_codec = snap_codec.clone();
+            welcome.surface_codec = surf_codec.clone();
+            ServerMessage::EndpointControl {
+                kind: ENDPOINT_WELCOME_KIND.into(),
+                data: serde_json::to_string(&welcome).map_err(io::Error::other)?,
+            }
+        } else {
+            ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                encoding: render_encoding,
+                error: None,
+            }
+        };
     protocol::write_message(&mut stream, &welcome).map_err(|e| io::Error::other(e.to_string()))?;
 
     set_client_recv_timeout(

@@ -1976,21 +1976,19 @@ async fn client_shell_pane_link_activate_resolves_and_activates() {
             boot_id: server.client_shell_boot_id.clone(),
             request: Box::new(api::schema::Request {
                 id: "act-1".into(),
-                method: api::schema::Method::PaneLinkActivate(api::schema::PaneLinkActivateParams {
-                    pane_id: public_pane_id,
-                    viewport_row: 0,
-                    col: 2,
-                    content_revision: Some(revision),
-                    offset_from_bottom: Some(0),
-                }),
+                method: api::schema::Method::PaneLinkActivate(
+                    api::schema::PaneLinkActivateParams {
+                        pane_id: public_pane_id,
+                        viewport_row: 0,
+                        col: 2,
+                        content_revision: Some(revision),
+                        offset_from_bottom: Some(0),
+                    }
+                ),
             }),
         })
     );
-    let response_ready = server
-        .server_event_rx
-        .recv()
-        .await
-        .expect("response ready");
+    let response_ready = server.server_event_rx.recv().await.expect("response ready");
     assert!(!server.handle_server_event(response_ready));
     let response_bytes = control.recv().expect("response");
     let msg = read_server_message(response_bytes);
