@@ -280,7 +280,12 @@ pub(crate) fn message(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> Opti
     }
     let mut scrolls = Vec::new();
     let mut residual = Vec::new();
-    for pane in &patch.panes {
+    let candidate_panes = if patch.panes.is_empty() {
+        &last.panes[..]
+    } else {
+        &patch.panes[..]
+    };
+    for pane in candidate_panes {
         let rect = pane.inner_rect;
         // Both peers hold the committed geometry; never scroll a region that moved.
         let committed = last

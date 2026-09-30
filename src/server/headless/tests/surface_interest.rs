@@ -898,6 +898,7 @@ async fn activating_surface_discards_a_stale_queued_render() {
         server.handle_server_event(ServerEvent::ClientShellConnected {
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             client_id,
             surface_cols: 80,
             surface_rows: 24,

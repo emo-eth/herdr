@@ -242,8 +242,8 @@ fn rgba_asset_and_placement() -> (SurfaceGraphicsAsset, SurfaceGraphicsPlacement
             },
             image_id: 419,
         },
-        image_width: 64,
-        image_height: 32,
+        image_width: 1,
+        image_height: 1,
         format: SurfaceGraphicsFormat::Rgba,
         data_len: 4,
         data_fingerprint: 419,
@@ -262,8 +262,8 @@ fn rgba_asset_and_placement() -> (SurfaceGraphicsAsset, SurfaceGraphicsPlacement
             rows: 3,
             source_x: 0,
             source_y: 0,
-            source_width: 64,
-            source_height: 32,
+            source_width: 1,
+            source_height: 1,
             x_offset: 0,
             y_offset: 0,
             z: 0,
@@ -279,7 +279,7 @@ fn graphics_delta_forces_full_compose_so_kitty_bytes_are_encoded() {
     state.set_pane_surface(surface());
     let initial = state.compose(100, 30).expect("initial compose");
     assert!(
-        !String::from_utf8_lossy(&initial.graphics).contains("a=t"),
+        !String::from_utf8_lossy(&initial.graphics.into_inline_bytes()).contains("a=t"),
         "seed frame must not already transmit"
     );
 
@@ -318,7 +318,8 @@ fn graphics_delta_forces_full_compose_so_kitty_bytes_are_encoded() {
     );
 
     let frame = state.compose(100, 30).expect("graphics compose");
-    let gfx = String::from_utf8_lossy(&frame.graphics);
+    let gfx_bytes = frame.graphics.into_inline_bytes();
+    let gfx = String::from_utf8_lossy(&gfx_bytes);
     assert!(
         gfx.contains("a=t") || gfx.contains("a=T"),
         "expected Kitty transmit, got {gfx:?}"

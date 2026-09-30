@@ -500,6 +500,7 @@ impl ClientState {
             self.scene.placements.push(add.clone());
         }
         self.scene.retained_assets = delta.retained_assets.clone();
+        self.refresh_display_scene();
     }
 
     pub(crate) fn update_resident_assets(
@@ -515,6 +516,7 @@ impl ClientState {
                 self.assets.insert(add.key.clone(), add.data.clone().into());
             }
         }
+        self.refresh_display_scene();
     }
 
     #[cfg(test)]

@@ -770,6 +770,8 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
         surface_reuse: false,
         surface_delta: false,
         surface_scroll: false,
+        snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+        surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
         writer,
     });
     let (_, initial) = client_shell_projection(&control_rx);
@@ -2183,7 +2185,6 @@ async fn workspace_create_no_focus_preserves_connected_client_location_when_acti
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
     let response = response_rx.recv().expect("response");
     let _: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -7365,7 +7366,6 @@ fn client_clipboard_set_api_reports_no_foreground_client() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert!(changed);
@@ -7418,7 +7418,6 @@ fn client_clipboard_set_api_forwards_to_foreground_client() {
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         })
     );
 
