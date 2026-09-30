@@ -1171,7 +1171,13 @@ fn agent_wait_tolerates_detection_uncertainty_and_pane_target_rename() {
     wait_for_socket(&socket_path, Duration::from_secs(5));
     let created = run_cli_json(
         &socket_path,
-        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+        &[
+            "workspace",
+            "create",
+            "--cwd",
+            base.to_str().unwrap(),
+            "--focus",
+        ],
     );
     let pane_id = created["result"]["root_pane"]["pane_id"]
         .as_str()
