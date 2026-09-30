@@ -184,7 +184,7 @@ fn client_mouse_selection_highlights_and_copies_through_endpoint_extraction() {
             row: pane.inner_rect.y,
             modifiers: KeyModifiers::empty(),
         })]);
-    assert!(state.selection.is_none());
+    assert!(state.selection.is_some());
     let [ClientShellAction::Endpoint { request, .. }] = &release.actions[..] else {
         panic!("selection release should request endpoint extraction");
     };
@@ -195,7 +195,7 @@ fn client_mouse_selection_highlights_and_copies_through_endpoint_extraction() {
             if params.pane_id == "pane_1"
                 && params.anchor == crate::api::schema::PaneTextPoint { row: 0, col: 0 }
                 && params.cursor == crate::api::schema::PaneTextPoint { row: 0, col: 2 }
-                && params.content_revision.is_none()
+                && params.content_revision == Some(0)
     ));
 
     let (repaint, actions) = state.handle_endpoint_result(
