@@ -64,6 +64,9 @@ async fn metadata_only_shell_is_isolated_until_surface_activation() {
 
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id,
             surface_cols: 101,
             surface_rows: 37,
@@ -74,13 +77,12 @@ async fn metadata_only_shell_is_isolated_until_surface_activation() {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: false,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
             writer,
         })
     );
-    assert!(matches!(
-        read_server_message(control_rx.recv().expect("metadata snapshot")),
-        ServerMessage::EndpointControl { .. }
-    ));
+    let _ = client_shell_snapshot(&control_rx);
     assert_eq!(server.foreground_client_id, None);
     assert_eq!(server.effective_size, original_size);
 
@@ -280,6 +282,9 @@ async fn background_surface_activation_preserves_focused_viewer_geometry() {
     let (writer, background_control, _) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id: 8,
             surface_cols: 100,
             surface_rows: 35,
@@ -290,6 +295,8 @@ async fn background_surface_activation_preserves_focused_viewer_geometry() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: false,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
             writer,
         })
     );
@@ -391,6 +398,9 @@ async fn presentation_sync_epoch_replays_modes_and_title() {
     let client_id = 63;
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id,
             surface_cols: 80,
             surface_rows: 24,
@@ -401,10 +411,12 @@ async fn presentation_sync_epoch_replays_modes_and_title() {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: true,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
             writer,
         })
     );
-    let _ = control_rx.recv().expect("initial snapshot");
+    let _ = client_shell_snapshot(&control_rx);
     server.api_window_title = Some("target title".into());
     {
         let client = server.clients.get_mut(&client_id).unwrap();
@@ -505,6 +517,9 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
     let source_client_id = 78;
     assert!(
         source_server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id: source_client_id,
             surface_cols: 80,
             surface_rows: 24,
@@ -515,14 +530,12 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: true,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
             writer: source_writer,
         })
     );
-    let source_snapshot = client_shell_snapshot(read_server_message(
-        source_control
-            .recv()
-            .expect("real source metadata snapshot"),
-    ));
+    let source_snapshot = client_shell_snapshot(&source_control);
 
     let mut target_server = test_headless_server();
     let _target_input = install_focused_test_runtime(&mut target_server, b"remote target");
@@ -530,6 +543,9 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
     let target_client_id = 79;
     assert!(
         target_server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id: target_client_id,
             surface_cols: 80,
             surface_rows: 24,
@@ -540,14 +556,12 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: false,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
             writer: target_writer,
         })
     );
-    let remote_snapshot = client_shell_snapshot(read_server_message(
-        target_control
-            .recv()
-            .expect("real target metadata snapshot"),
-    ));
+    let remote_snapshot = client_shell_snapshot(&target_control);
 
     let profile = SavedSshEndpoint {
         id: ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
@@ -675,9 +689,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
     );
 
     target_server.render_and_stream();
-    let coherent_snapshot = client_shell_snapshot(read_server_message(
-        target_control.recv().expect("target replacement snapshot"),
-    ));
+    let coherent_snapshot = client_shell_snapshot(&target_control);
     let snapshot_progress = activation.receive_snapshot(&target_id, 7, &coherent_snapshot);
     shell.set_endpoint_snapshot(&target_id, coherent_snapshot);
     assert_eq!(
@@ -690,7 +702,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
         panic!("expected target pane surface");
     };
     assert_eq!(
-        activation.receive_surface(&target_id, 7, coherent_surface),
+        activation.receive_surface(&target_id, 7, coherent_surface, Some(&mut shell)),
         crate::client::endpoint::SurfaceActivationProgress::Ready
     );
 
@@ -743,6 +755,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
         activation.receive_response(&target_id, 7, &sync_request_id, &sync_data, &mut endpoints,),
         crate::client::endpoint::SurfaceActivationProgress::Pending
     );
+    std::thread::sleep(std::time::Duration::from_millis(55));
     target_server.render_and_stream();
     let sync_snapshot = loop {
         let message =
@@ -765,7 +778,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
         panic!("expected synchronized target surface");
     };
     assert_eq!(
-        activation.receive_surface(&target_id, 7, sync_surface),
+        activation.receive_surface(&target_id, 7, sync_surface, Some(&mut shell)),
         crate::client::endpoint::SurfaceActivationProgress::Ready
     );
     assert_eq!(
@@ -863,4 +876,59 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
     );
     shutdown_test_runtimes(&mut source_server);
     shutdown_test_runtimes(&mut target_server);
+}
+
+#[tokio::test]
+async fn activating_surface_discards_a_stale_queued_render() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("activate-discard");
+    let pane_id = workspace.focused_pane_id().expect("focused pane");
+    workspace.insert_test_runtime(
+        pane_id,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"queued"),
+    );
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+
+    let writer = crate::server::client_transport::ClientWriter::test_undrained_queue();
+    let client_id = 61;
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
+            client_id,
+            surface_cols: 80,
+            surface_rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+            direct_graphics: false,
+            endpoint_keybindings: false,
+            mouse_capture: false,
+            surface_active: true,
+            snapshot_codec: crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into(),
+            surface_codec: crate::protocol::endpoint::SURFACE_CODEC_V1.into(),
+            writer,
+        })
+    );
+    server.render_and_stream();
+    let first_projection = server.clients[&client_id].shell_projection_revision;
+    assert!(server.clients[&client_id]
+        .render_state
+        .last_pane_surface()
+        .is_some());
+
+    request_active_surface(&mut server, client_id, "reactivate");
+    server.render_and_stream();
+    let last = server.clients[&client_id]
+        .render_state
+        .last_pane_surface()
+        .expect("activation must replace the discarded queued seed");
+    let after_projection = server.clients[&client_id].shell_projection_revision;
+    assert!(after_projection > first_projection);
+    assert_eq!(last.projection_revision, after_projection);
+    shutdown_test_runtimes(&mut server);
 }

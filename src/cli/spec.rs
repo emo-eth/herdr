@@ -46,7 +46,8 @@ pub(super) fn command() -> Command {
         .subcommand(terminal_command())
         .subcommand(session_command())
         .subcommand(integration_command())
-        .subcommand(plugin_command());
+        .subcommand(plugin_command())
+        .subcommand(clipboard_command());
     configure_help(command, 0)
 }
 
@@ -646,6 +647,7 @@ fn report_agent_command() -> Command {
         .arg(option("seq", "N"))
         .arg(option("agent-session-id", "ID"))
         .arg(path_option("agent-session-path", "PATH"))
+        .arg(resume_argv_arg())
 }
 
 fn report_agent_session_command() -> Command {
@@ -658,6 +660,15 @@ fn report_agent_session_command() -> Command {
         .arg(option("agent-session-id", "ID"))
         .arg(path_option("agent-session-path", "PATH"))
         .arg(option("session-start-source", "SOURCE"))
+        .arg(resume_argv_arg())
+}
+
+fn resume_argv_arg() -> Arg {
+    Arg::new("resume_argv")
+        .value_name("RESUME_ARG")
+        .num_args(0..)
+        .last(true)
+        .help("Command that resumes this session after a Herdr restart; starts with a plain command name")
 }
 
 fn release_agent_command() -> Command {
@@ -905,6 +916,16 @@ fn integration_target_values() -> Vec<&'static str> {
 
 fn id_command(name: &'static str, id: &'static str, about: &'static str) -> Command {
     Command::new(name).about(about).arg(required(id, id))
+}
+
+fn clipboard_command() -> Command {
+    Command::new("clipboard")
+        .about("Manage clipboard content")
+        .subcommand(
+            Command::new("set")
+                .about("Set foreground client clipboard content")
+                .arg(flag("stdin").help("Read clipboard text from stdin")),
+        )
 }
 
 fn direction_option() -> Arg {

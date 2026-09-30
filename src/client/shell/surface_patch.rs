@@ -3,11 +3,40 @@ use super::*;
 pub(crate) struct ClientComposedSurfacePatch {
     pub(crate) rows: Vec<crate::protocol::PaneSurfacePatchRow>,
     pub(crate) cursor: Option<crate::protocol::CursorState>,
+    pub(crate) appended_hyperlinks: Vec<String>,
 }
 
 pub(crate) enum ClientPaneSurfacePatchOutcome {
     Rejected,
     Applied(Option<ClientComposedSurfacePatch>),
+}
+
+fn row_hits_pane(
+    row: &crate::protocol::PaneSurfacePatchRow,
+    pane: &crate::protocol::PaneSurfacePane,
+    current: &crate::protocol::PaneSurfaceFrame,
+) -> bool {
+    let terminal_row = row.x >= pane.inner_rect.x
+        && row.y >= pane.inner_rect.y
+        && row.y < pane.inner_rect.y.saturating_add(pane.inner_rect.height)
+        && row
+            .x
+            .saturating_add(row.cells.len().min(u16::MAX as usize) as u16)
+            <= pane.inner_rect.x.saturating_add(pane.inner_rect.width);
+    let scrollbar_rect = pane.scrollbar_rect.or_else(|| {
+        current
+            .panes
+            .iter()
+            .find(|existing| existing.pane_id == pane.pane_id)
+            .and_then(|existing| existing.scrollbar_rect)
+    });
+    let scrollbar_row = scrollbar_rect.is_some_and(|rect| {
+        row.x == rect.x
+            && row.y >= rect.y
+            && row.y < rect.y.saturating_add(rect.height)
+            && row.cells.len() == usize::from(rect.width)
+    });
+    terminal_row || scrollbar_row
 }
 
 fn row_fits_frame(row: &crate::protocol::PaneSurfacePatchRow, frame: &FrameData) -> bool {
@@ -54,9 +83,8 @@ fn apply_patch_to_surface(
     true
 }
 
-fn fast_path_blocker(
+pub(super) fn client_local_overlay_blocks_direct_blit(
     state: &ClientShellState,
-    patch: &crate::protocol::PaneSurfacePatch,
 ) -> Option<&'static str> {
     if state.mode != ClientShellMode::Terminal {
         Some("client_surface_patch.fallback.mode")
@@ -72,14 +100,27 @@ fn fast_path_blocker(
         Some("client_surface_patch.fallback.notification")
     } else if state.copy_feedback.is_some() {
         Some("client_surface_patch.fallback.copy_feedback")
-    } else if state.link_hover_blocks_patch(patch) {
-        Some("client_surface_patch.fallback.link_hover")
     } else if state.selection.is_some() {
         Some("client_surface_patch.fallback.selection")
+    } else if state.word_selection_gesture.is_some() {
+        Some("client_surface_patch.fallback.word_selection")
     } else if state.copy_mode.is_some() {
         Some("client_surface_patch.fallback.copy_mode")
     } else if state.selection_highlight_clear_deadline.is_some() {
         Some("client_surface_patch.fallback.selection_deadline")
+    } else {
+        None
+    }
+}
+
+fn fast_path_blocker(
+    state: &ClientShellState,
+    patch: &crate::protocol::PaneSurfacePatch,
+) -> Option<&'static str> {
+    if let Some(reason) = client_local_overlay_blocks_direct_blit(state) {
+        Some(reason)
+    } else if state.link_hover_blocks_patch(patch) {
+        Some("client_surface_patch.fallback.link_hover")
     } else if patch.panes.iter().any(|pane| {
         !state
             .hits
@@ -140,28 +181,13 @@ impl ClientShellState {
         for row in &patch.rows {
             if !row_fits_frame(row, &current.frame)
                 || row.cells.is_empty()
-                || !patch.panes.iter().any(|pane| {
-                    let terminal_row = row.x >= pane.inner_rect.x
-                        && row.y >= pane.inner_rect.y
-                        && row.y < pane.inner_rect.y.saturating_add(pane.inner_rect.height)
-                        && row
-                            .x
-                            .saturating_add(row.cells.len().min(u16::MAX as usize) as u16)
-                            <= pane.inner_rect.x.saturating_add(pane.inner_rect.width);
-                    let scrollbar_rect = pane.scrollbar_rect.or_else(|| {
-                        current
-                            .panes
-                            .iter()
-                            .find(|existing| existing.pane_id == pane.pane_id)
-                            .and_then(|existing| existing.scrollbar_rect)
-                    });
-                    let scrollbar_row = scrollbar_rect.is_some_and(|rect| {
-                        row.x == rect.x
-                            && row.y >= rect.y
-                            && row.y < rect.y.saturating_add(rect.height)
-                            && row.cells.len() == usize::from(rect.width)
-                    });
-                    terminal_row || scrollbar_row
+                || !current.panes.iter().any(|base| {
+                    let pane = patch
+                        .panes
+                        .iter()
+                        .find(|pane| pane.pane_id == base.pane_id)
+                        .unwrap_or(base);
+                    row_hits_pane(row, pane, current)
                 })
             {
                 return ClientPaneSurfacePatchOutcome::Rejected;
@@ -188,20 +214,20 @@ impl ClientShellState {
                 .collect(),
             cursor: patch
                 .cursor
-                .clone()
+                .as_ref()
                 .map(|cursor| crate::protocol::CursorState {
                     x: area.x.saturating_add(cursor.x),
                     y: area.y.saturating_add(cursor.y),
                     visible: cursor.visible,
                     shape: cursor.shape,
                 }),
+            appended_hyperlinks: Vec::new(),
         });
         if let Some(area) = fast_path_area {
-            let applied = self
-                .pane_surface
-                .as_mut()
-                .is_some_and(|surface| apply_patch_to_surface(surface, &patch));
-            if !applied {
+            let Some(surface) = self.pane_surface.as_mut() else {
+                return ClientPaneSurfacePatchOutcome::Rejected;
+            };
+            if !apply_patch_to_surface(surface, &patch) {
                 return ClientPaneSurfacePatchOutcome::Rejected;
             }
             for updated in &patch.panes {
@@ -213,6 +239,7 @@ impl ClientShellState {
                 else {
                     continue;
                 };
+                hit.content_revision = updated.content_revision;
                 hit.scrollbar_rect = updated.scrollbar_rect.map(|rect| {
                     Rect::new(
                         area.x.saturating_add(rect.x),

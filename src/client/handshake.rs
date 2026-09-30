@@ -11,8 +11,8 @@ use tracing::info;
 use crate::ipc::LocalStream;
 use crate::protocol::endpoint::{
     EndpointClientHello, EndpointServerWelcome, BLOB_CODEC_V1, ENDPOINT_HELLO_KIND,
-    ENDPOINT_PROTOCOL_GENERATION, ENDPOINT_WELCOME_KIND, INPUT_CODEC_V1, SNAPSHOT_CODEC_V1,
-    SURFACE_CODEC_V1,
+    ENDPOINT_PROTOCOL_GENERATION, ENDPOINT_WELCOME_KIND, INPUT_CODEC_V1, SNAPSHOT_CODEC_DELTA_V2,
+    SNAPSHOT_CODEC_V1, SURFACE_CODEC_V1,
 };
 use crate::protocol::{
     self, ClientMessage, RenderEncoding, ServerMessage, MAX_FRAME_SIZE, PROTOCOL_VERSION,
@@ -67,6 +67,17 @@ pub(super) fn direct_graphics_profile_values(
         || matches!(term, "xterm-ghostty" | "xterm-kitty" | "xterm-wezterm")
         || kitty_window;
     supported && !blocked_transport && terminals
+}
+
+/// Server-owned files require a shared filesystem; the host terminal profile alone
+/// cannot establish that for a saved SSH endpoint.
+fn direct_graphics_capability(
+    local_transport: bool,
+    exact_cell_size: bool,
+    cell_size: (u32, u32),
+    profile_allowed: bool,
+) -> bool {
+    local_transport && exact_cell_size && cell_size.0 > 0 && cell_size.1 > 0 && profile_allowed
 }
 
 #[cfg(unix)]
@@ -138,6 +149,7 @@ pub(crate) fn probe_endpoint_negotiation(
         false,
         false,
         false,
+        false, // This probe uses an SSH bridge, not a shared filesystem.
     )
     .map_err(io::Error::other)?;
     Ok(super::endpoint::EndpointNegotiation::new(
@@ -150,7 +162,8 @@ pub(crate) fn probe_endpoint_negotiation(
 ///
 /// Direct terminal clients retain the same-install private protocol. Client-owned
 /// shells use the stable endpoint generation and negotiate whole codecs without
-/// comparing Herdr build versions.
+/// comparing Herdr build versions. `local_transport` means the endpoint shares the
+/// client's filesystem, not merely that its bridge exposes a local socket.
 pub(super) fn do_handshake(
     stream: &mut LocalStream,
     cols: u16,
@@ -162,6 +175,7 @@ pub(super) fn do_handshake(
     endpoint_keybindings: bool,
     mouse_capture: bool,
     surface_active: bool,
+    local_transport: bool,
 ) -> Result<HandshakeResult, ClientError> {
     stream
         .set_nonblocking(false)
@@ -175,14 +189,19 @@ pub(super) fn do_handshake(
             cell_height_px,
             surface_size,
             pixel_mouse: exact_cell_size && cfg!(unix),
-            direct_graphics: exact_cell_size
-                && cell_width_px > 0
-                && cell_height_px > 0
-                && direct_graphics_profile_allowed(),
+            direct_graphics: direct_graphics_capability(
+                local_transport,
+                exact_cell_size,
+                (cell_width_px, cell_height_px),
+                direct_graphics_profile_allowed(),
+            ),
             endpoint_keybindings,
             mouse_capture,
             surface_active,
-            snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
+            surface_reuse: true,
+            surface_delta: true,
+            surface_scroll: true,
+            snapshot_codecs: vec![SNAPSHOT_CODEC_DELTA_V2.into(), SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
             blob_codecs: vec![BLOB_CODEC_V1.into()],
@@ -249,9 +268,12 @@ pub(super) fn do_handshake(
                 error: error.message,
             });
         }
+        let valid_snapshot = welcome.snapshot_codec == SNAPSHOT_CODEC_V1
+            || welcome.snapshot_codec == SNAPSHOT_CODEC_DELTA_V2;
+        let valid_surface = welcome.surface_codec == SURFACE_CODEC_V1;
         if welcome.generation != ENDPOINT_PROTOCOL_GENERATION
-            || welcome.snapshot_codec != SNAPSHOT_CODEC_V1
-            || welcome.surface_codec != SURFACE_CODEC_V1
+            || !valid_snapshot
+            || !valid_surface
             || welcome.input_codec != INPUT_CODEC_V1
             || welcome.blob_codec != BLOB_CODEC_V1
         {
@@ -291,5 +313,22 @@ pub(super) fn do_handshake(
         _ => Err(ClientError::Protocol(protocol::FramingError::Io(
             io::Error::new(io::ErrorKind::InvalidData, "expected Welcome message"),
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_graphics_requires_local_transport_even_on_supported_host_terminal() {
+        let supported = direct_graphics_profile_values("ghostty", "", false, false, true);
+        assert!(supported);
+        assert!(direct_graphics_capability(true, true, (8, 16), supported));
+        assert!(!direct_graphics_capability(false, true, (8, 16), supported));
+        assert!(!direct_graphics_capability(true, false, (8, 16), supported));
+        assert!(!direct_graphics_capability(true, true, (0, 16), supported));
+        assert!(!direct_graphics_capability(true, true, (8, 0), supported));
+        assert!(!direct_graphics_capability(true, true, (8, 16), false));
     }
 }

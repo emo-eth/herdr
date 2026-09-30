@@ -13,11 +13,31 @@ use protocol::*;
 
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn release_surface_best_effort(
+    lease: &EndpointLease,
+    endpoints: &mut EndpointRegistry,
+    request_id: String,
+) {
+    if !endpoints.accepts(&lease.endpoint_id, lease.generation) {
+        return;
+    }
+    endpoints.set_surface_active(&lease.endpoint_id, false);
+    let _ = endpoints.send_to(
+        &lease.endpoint_id,
+        &crate::protocol::ClientMessage::ClientShellFocus { focused: false },
+    );
+    match surface_interest_request(&lease.boot_id, request_id, false) {
+        Ok(request) => {
+            let _ = endpoints.send_to(&lease.endpoint_id, &request);
+        }
+        Err(error) => tracing::warn!(%error, "could not request abandoned surface cleanup"),
+    }
+}
+
 impl PendingEndpointActivation {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn begin(
+    pub(crate) fn prepare(
         shell: &crate::client::shell::ClientShellState,
-        endpoints: &mut EndpointRegistry,
+        endpoints: &EndpointRegistry,
         target: ClientEndpointId,
         focus: Option<crate::client::shell::ClientEndpointFocusTarget>,
         resize: crate::protocol::ClientMessage,
@@ -60,16 +80,14 @@ impl PendingEndpointActivation {
         let source_is_target = source.endpoint_id == target_lease.endpoint_id;
         // Validate every typed lifecycle and optional focus envelope before the first transport
         // write. Any error above this line is guaranteed not to have changed either endpoint.
-        let source_release_request = (source_available && !source_is_target)
-            .then(|| {
-                surface_interest_request(
-                    &source.boot_id,
-                    format!("client-shell-surface:{serial}:off"),
-                    false,
-                )
-            })
-            .transpose()
+        if source_available && !source_is_target {
+            surface_interest_request(
+                &source.boot_id,
+                format!("client-shell-surface:{serial}:off"),
+                false,
+            )
             .map_err(|error| ActivationBeginError::Preflight(error.to_string()))?;
+        }
         surface_interest_request(
             &target_lease.boot_id,
             format!("client-shell-surface:{serial}:on"),
@@ -85,14 +103,13 @@ impl PendingEndpointActivation {
             .map_err(|error| ActivationBeginError::Preflight(error.to_string()))?;
         }
 
-        endpoints.freeze_input();
-        let mut activation = Self {
+        Ok(Self {
             source,
             source_available,
             target: target_lease,
             focus,
             host_focused: shell.host_focus_baseline(),
-            resize: resize.clone(),
+            resize,
             phase: ActivationPhase::ReleasingSource {
                 request_id: format!("client-shell-surface:{serial}:off"),
             },
@@ -101,44 +118,82 @@ impl PendingEndpointActivation {
             next_focus_serial: 0,
             rollback_error: None,
             successor: None,
-        };
+        })
+    }
 
-        // Reconnecting the selected endpoint has no live source surface to release. All normal
-        // handoffs must make the source locally inactive before a target request is even sent.
-        if source_is_target || !source_available {
-            if let Err(error) = activation.start_target(endpoints, resize) {
-                return Err(ActivationBeginError::Partial {
-                    activation: Box::new(activation),
-                    error,
-                });
-            }
-        } else {
-            // `surface.set(false)` removes the viewer, but old servers only emit the PTY focus
-            // loss while the viewer is still active. Revoke it explicitly before source-off.
-            if endpoints.send_to(
-                &activation.source.endpoint_id,
-                &crate::protocol::ClientMessage::ClientShellFocus { focused: false },
-            ) != EndpointSendOutcome::Sent
-            {
-                return Err(ActivationBeginError::Partial {
-                    activation: Box::new(activation),
-                    error: "source endpoint focus revoke could not be sent".into(),
-                });
-            }
-            let request = source_release_request.expect("validated source release request");
-            if endpoints.send_to(&activation.source.endpoint_id, &request)
-                != EndpointSendOutcome::Sent
-            {
-                return Err(ActivationBeginError::Partial {
-                    activation: Box::new(activation),
-                    error: "source endpoint release could not be sent".into(),
-                });
-            }
-            // This is deliberately before the acknowledgement: the source is no longer viewed
-            // locally while its release is in flight, and pane input is consequently blocked.
-            endpoints.set_surface_active(&activation.source.endpoint_id, false);
+    pub(crate) fn start(
+        mut self,
+        endpoints: &mut EndpointRegistry,
+    ) -> Result<Self, ActivationBeginError> {
+        endpoints.freeze_input();
+        match self.start_prepared(endpoints) {
+            Ok(()) => Ok(self),
+            Err(error) => Err(ActivationBeginError::Partial {
+                activation: Box::new(self),
+                error,
+            }),
         }
-        Ok(activation)
+    }
+
+    fn start_prepared(&mut self, endpoints: &mut EndpointRegistry) -> Result<(), String> {
+        let source_is_target = self.source.endpoint_id == self.target.endpoint_id;
+        // Local must not depend on a remote acknowledgement to become usable.
+        if source_is_target || !self.source_available || self.target.endpoint_id.is_local() {
+            if self.source_available && !source_is_target {
+                release_surface_best_effort(
+                    &self.source,
+                    endpoints,
+                    format!("client-shell-surface:{}:off", self.epoch),
+                );
+            }
+            return self.start_target(endpoints, self.resize.clone());
+        }
+        // Old servers emit PTY focus loss only while the viewer is still active.
+        if endpoints.send_to(
+            &self.source.endpoint_id,
+            &crate::protocol::ClientMessage::ClientShellFocus { focused: false },
+        ) != EndpointSendOutcome::Sent
+        {
+            return Err("source endpoint focus revoke could not be sent".into());
+        }
+        let request = surface_interest_request(
+            &self.source.boot_id,
+            format!("client-shell-surface:{}:off", self.epoch),
+            false,
+        )
+        .map_err(|error| error.to_string())?;
+        if endpoints.send_to(&self.source.endpoint_id, &request) != EndpointSendOutcome::Sent {
+            return Err("source endpoint release could not be sent".into());
+        }
+        endpoints.set_surface_active(&self.source.endpoint_id, false);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin(
+        shell: &crate::client::shell::ClientShellState,
+        endpoints: &mut EndpointRegistry,
+        target: ClientEndpointId,
+        focus: Option<crate::client::shell::ClientEndpointFocusTarget>,
+        resize: crate::protocol::ClientMessage,
+        serial: u64,
+        now: Instant,
+    ) -> Result<Self, ActivationBeginError> {
+        Self::prepare(shell, endpoints, target, focus, resize, serial, now)?.start(endpoints)
+    }
+
+    pub(crate) fn abandon(&self, endpoints: &mut EndpointRegistry) {
+        endpoints.freeze_input();
+        for lease in [&self.source, &self.target] {
+            release_surface_best_effort(
+                lease,
+                endpoints,
+                format!("client-shell-surface:{}:abandon", self.epoch),
+            );
+            if self.source.endpoint_id == self.target.endpoint_id {
+                break;
+            }
+        }
     }
 
     pub(crate) fn target(&self) -> &ClientEndpointId {
@@ -482,11 +537,13 @@ impl PendingEndpointActivation {
         endpoint_id: &ClientEndpointId,
         generation: u64,
         surface: crate::protocol::PaneSurfaceFrame,
+        shell: Option<&mut crate::client::shell::ClientShellState>,
     ) -> SurfaceActivationProgress {
         let lease = match &self.phase {
             ActivationPhase::ActivatingTarget { .. } => &self.target,
             ActivationPhase::RestoringSource { .. } => &self.source,
-            ActivationPhase::SynchronizingPresentation { lease, .. } => lease,
+            ActivationPhase::SynchronizingPresentation { lease, .. }
+            | ActivationPhase::AwaitingPresentationEffects { lease, .. } => lease,
             _ => return SurfaceActivationProgress::Stale,
         };
         if !endpoint_matches(lease, endpoint_id, generation, &surface.boot_id) {
@@ -497,13 +554,119 @@ impl PendingEndpointActivation {
         }
         match &mut self.phase {
             ActivationPhase::ActivatingTarget { evidence, .. }
-            | ActivationPhase::RestoringSource { evidence, .. }
-            | ActivationPhase::SynchronizingPresentation { evidence, .. } => {
-                evidence.record_surface(surface)
+            | ActivationPhase::RestoringSource { evidence, .. } => {
+                evidence.record_surface(surface);
+            }
+            ActivationPhase::SynchronizingPresentation { evidence, .. } => {
+                evidence.record_surface(surface.clone());
+                if let Some(shell) = shell {
+                    shell.set_pane_surface(surface);
+                }
+            }
+            ActivationPhase::AwaitingPresentationEffects { .. } => {
+                if let Some(shell) = shell {
+                    shell.set_pane_surface(surface);
+                }
             }
             _ => unreachable!("checked activation phase"),
         }
         self.progress()
+    }
+
+    pub(crate) fn receive_surface_patch(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        generation: u64,
+        patch: crate::protocol::PaneSurfacePatch,
+        shell: Option<&mut crate::client::shell::ClientShellState>,
+    ) -> SurfaceActivationProgress {
+        let lease = match &self.phase {
+            ActivationPhase::ActivatingTarget { .. } => &self.target,
+            ActivationPhase::RestoringSource { .. } => &self.source,
+            ActivationPhase::SynchronizingPresentation { lease, .. }
+            | ActivationPhase::AwaitingPresentationEffects { lease, .. } => lease,
+            _ => return SurfaceActivationProgress::Stale,
+        };
+        if !endpoint_matches(lease, endpoint_id, generation, &patch.boot_id) {
+            return SurfaceActivationProgress::Stale;
+        }
+        match &mut self.phase {
+            ActivationPhase::ActivatingTarget { evidence, .. }
+            | ActivationPhase::RestoringSource { evidence, .. } => {
+                if let Some(surface) = evidence.surface.as_mut() {
+                    if let Err(error) = patch.apply_to(surface) {
+                        tracing::debug!(
+                            error = %error,
+                            "activation compact patch did not apply; requesting a seed"
+                        );
+                        evidence.seed_resync_pending = true;
+                        return SurfaceActivationProgress::Pending;
+                    }
+                } else {
+                    tracing::debug!("activation compact patch ignored without a seed surface");
+                }
+            }
+            ActivationPhase::SynchronizingPresentation { evidence, .. } => {
+                let mut failed = evidence
+                    .surface
+                    .as_mut()
+                    .is_some_and(|surface| patch.apply_to(surface).is_err());
+                if let Some(shell) = shell {
+                    failed |= matches!(
+                        shell.apply_pane_surface_patch(patch),
+                        crate::client::shell::ClientPaneSurfacePatchOutcome::Rejected
+                    );
+                }
+                if failed {
+                    evidence.seed_resync_pending = true;
+                }
+            }
+            ActivationPhase::AwaitingPresentationEffects { .. } => {
+                if let Some(shell) = shell {
+                    let _ = shell.apply_pane_surface_patch(patch);
+                }
+            }
+            _ => {}
+        }
+        self.progress()
+    }
+
+    fn mark_seed_resync_pending(&mut self) {
+        match &mut self.phase {
+            ActivationPhase::ActivatingTarget { evidence, .. }
+            | ActivationPhase::RestoringSource { evidence, .. }
+            | ActivationPhase::SynchronizingPresentation { evidence, .. } => {
+                evidence.seed_resync_pending = true;
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn request_seed_if_needed(&mut self, endpoints: &mut EndpointRegistry) {
+        let needed = match &self.phase {
+            ActivationPhase::ActivatingTarget { evidence, .. }
+            | ActivationPhase::RestoringSource { evidence, .. }
+            | ActivationPhase::SynchronizingPresentation { evidence, .. } => {
+                evidence.seed_resync_pending
+            }
+            _ => false,
+        };
+        if !needed {
+            return;
+        }
+        match &mut self.phase {
+            ActivationPhase::ActivatingTarget { evidence, .. }
+            | ActivationPhase::RestoringSource { evidence, .. }
+            | ActivationPhase::SynchronizingPresentation { evidence, .. } => {
+                evidence.seed_resync_pending = false;
+            }
+            _ => {}
+        }
+        let resize = self.resize.clone();
+        if let Err(error) = self.update_resize(resize, endpoints) {
+            tracing::debug!(%error, "activation seed recovery resize failed");
+            self.mark_seed_resync_pending();
+        }
     }
 
     pub(crate) fn receive_presentation_effects_ready(
@@ -821,22 +984,11 @@ impl PendingEndpointActivation {
         endpoints: &mut EndpointRegistry,
     ) -> Result<ActivationCompletion, String> {
         if let ActivationPhase::SynchronizingPresentation {
-            lease,
-            acknowledged_revision,
-            evidence,
-            completion,
-            ..
+            lease, completion, ..
         } = &self.phase
         {
             let lease = lease.clone();
             let completion = (**completion).clone();
-            let surface = coherent_completion_surface(
-                shell,
-                &lease,
-                evidence,
-                *acknowledged_revision,
-                self.geometry(),
-            )?;
             if endpoints.active_id() != &lease.endpoint_id
                 || !shell.endpoint_projection_available(&lease.endpoint_id)
                 || !shell.activate_endpoint_projection(&lease.endpoint_id)
@@ -845,7 +997,6 @@ impl PendingEndpointActivation {
                     "endpoint became unavailable during presentation synchronization".into(),
                 );
             }
-            shell.set_pane_surface(surface);
             self.start_presentation_effects_fence(endpoints, lease, completion)?;
             return Ok(ActivationCompletion::AwaitingPresentationEffects);
         }
@@ -858,7 +1009,8 @@ impl PendingEndpointActivation {
             return Ok((**completion).clone());
         }
 
-        let (lease, evidence, acknowledgement_revision, completion) = match &self.phase {
+        let geometry = self.geometry();
+        let (lease, evidence_owned, acknowledgement_revision, completion) = match &mut self.phase {
             ActivationPhase::ActivatingTarget {
                 evidence,
                 acknowledged_revision,
@@ -896,9 +1048,9 @@ impl PendingEndpointActivation {
         let surface = coherent_completion_surface(
             shell,
             &lease,
-            evidence,
+            evidence_owned,
             acknowledgement_revision,
-            self.geometry(),
+            geometry,
         )?;
         endpoints.set_surface_active(&lease.endpoint_id, true);
         shell.set_endpoint_status(&lease.endpoint_id, ClientEndpointStatus::Online);

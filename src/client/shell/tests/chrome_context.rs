@@ -47,6 +47,104 @@ fn tab_overflow_controls_scroll_the_client_owned_tab_bar() {
 }
 
 #[test]
+fn focused_last_overflow_tab_shows_its_full_label() {
+    let mut projected = snapshot();
+    let labels = [
+        "1",
+        "Laiza Portfolio Site",
+        "linkedin posts",
+        "update cv",
+        "nvim",
+        "brother",
+        "day organiser",
+        "nvim test",
+    ];
+    projected.tabs = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| ClientShellTab {
+            tab_id: format!("tab_{}", index + 1),
+            workspace_id: "ws_1".into(),
+            number: index + 1,
+            label: (*label).into(),
+            custom_label: index > 0,
+            zoomed: false,
+            focused: index == 7,
+            agent_status: AgentStatus::Idle,
+        })
+        .collect();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    for number in [8, 7, 8] {
+        let tab_id = format!("tab_{number}");
+        projected.focused_tab_id = Some(tab_id.clone());
+        projected.workspaces[0].active_tab_id = tab_id.clone();
+        projected.panes[0].tab_id = tab_id.clone();
+        for tab in &mut projected.tabs {
+            tab.focused = tab.tab_id == tab_id;
+        }
+        state.set_snapshot(Box::new(projected.clone()));
+        state.set_pane_surface(surface());
+        let frame = state
+            .compose(133, 20)
+            .expect("reporter's overflowing strip");
+        assert_eq!(
+            state.hits.new_tab.right() - state.hits.tab_scroll_left.x,
+            107
+        );
+        let rect = state
+            .hits
+            .tabs
+            .iter()
+            .find(|(_, id)| id == &tab_id)
+            .expect("focused tab")
+            .0;
+        let text = (rect.x..rect.right())
+            .map(|x| {
+                frame.cells[(rect.y * frame.width + x) as usize]
+                    .symbol
+                    .as_str()
+            })
+            .collect::<String>();
+        assert!(
+            text.contains(labels[number - 1]),
+            "focused tab rendered as {text:?}, rect={rect:?}"
+        );
+    }
+
+    // Manual scrolling must be able to reveal the rest of a partially drawn last tab.
+    let end_scroll = state.tab_scroll;
+    let left = state.hits.tab_scroll_left;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: left.x + 1,
+        row: left.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    let frame = state.compose(133, 20).expect("manual scroll left");
+    assert_eq!(state.tab_scroll, end_scroll - 1);
+    let right = state.hits.tab_scroll_right;
+    assert_eq!(
+        frame.cells[(right.y * frame.width + right.x + 1) as usize].fg,
+        crate::protocol::color_to_u32(state.config.palette.overlay1),
+        "right arrow stays enabled while the final tab is clipped"
+    );
+    state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: right.x + 1,
+        row: right.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    let frame = state.compose(133, 20).expect("manual scroll right");
+    assert_eq!(state.tab_scroll, end_scroll);
+    assert!(frame_rows(&frame)[0].contains("nvim test"));
+    assert_eq!(
+        frame.cells[(right.y * frame.width + right.x + 1) as usize].fg,
+        crate::protocol::color_to_u32(state.config.palette.overlay0),
+        "right arrow dims at the useful scroll limit"
+    );
+}
+
+#[test]
 fn focused_workspace_change_reveals_new_workspace_in_full_sidebar() {
     let mut initial = snapshot();
     let template = initial.workspaces[0].clone();
@@ -376,7 +474,7 @@ fn new_tab_overlay_owns_text_cursor_and_submits_public_api_request() {
 }
 
 #[test]
-fn close_confirmation_error_becomes_client_owned_overlay_and_stable_group_close() {
+fn close_confirmation_error_becomes_client_owned_overlay_and_stable_workspace_close() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
@@ -422,6 +520,69 @@ fn close_confirmation_error_becomes_client_owned_overlay_and_stable_group_close(
     assert!(matches!(
         &request.method,
         crate::api::schema::Method::WorkspaceClose(params)
-            if params.workspace_id == "ws_1" && params.close_group
+            if params.workspace_id == "ws_1" && !params.close_group
     ));
+}
+
+#[test]
+fn chrome_only_compose_keeps_pane_and_split_hits() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let layout = state.layout(80, 24);
+    let area = layout.pane_surface;
+    let mut pane_surface = surface();
+    pane_surface.frame.width = area.width;
+    pane_surface.frame.height = area.height;
+    pane_surface.frame.cells = vec![
+        crate::protocol::CellData {
+            symbol: " ".into(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink: None,
+        };
+        usize::from(area.width) * usize::from(area.height)
+    ];
+    pane_surface.panes[0].rect = SurfaceRect {
+        x: 0,
+        y: 0,
+        width: area.width,
+        height: area.height,
+    };
+    pane_surface.panes[0].inner_rect = pane_surface.panes[0].rect;
+    pane_surface.splits.push(PaneSurfaceSplit {
+        direction: PaneSurfaceSplitDirection::Horizontal,
+        pos: area.width / 2,
+        area: SurfaceRect {
+            x: 0,
+            y: 0,
+            width: area.width,
+            height: area.height,
+        },
+        hit_rect: SurfaceRect {
+            x: area.width / 2,
+            y: 0,
+            width: 1,
+            height: area.height,
+        },
+        path: vec![false, true],
+    });
+    state.set_pane_surface(pane_surface);
+    let frame = state.compose(80, 24).expect("full compose");
+    assert!(!state.hits.panes.is_empty());
+    assert!(!state.hits.pane_splits.is_empty());
+    let pane_count = state.hits.panes.len();
+    let split_count = state.hits.pane_splits.len();
+
+    let mut renamed = state.snapshot.as_deref().expect("snapshot").clone();
+    renamed.revision = 2;
+    renamed.workspaces[0].label = "renamed".into();
+    state.set_snapshot(Box::new(renamed));
+    assert!(
+        state.compose_chrome_patch(80, 24, Some(&frame)).is_some(),
+        "chrome-only snapshot update should patch"
+    );
+    assert_eq!(state.hits.panes.len(), pane_count);
+    assert_eq!(state.hits.pane_splits.len(), split_count);
 }

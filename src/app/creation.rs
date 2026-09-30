@@ -152,7 +152,7 @@ impl App {
         let workspace_id = self.state.workspaces[idx].id.clone();
         let root_pane = self.state.workspaces[idx].tabs[0].root_pane.raw();
         crate::logging::workspace_created(&workspace_id, root_pane);
-        if focus || self.state.active.is_none() {
+        if focus {
             self.state.switch_workspace(idx);
             self.state.mode = Mode::Terminal;
         }
@@ -340,6 +340,7 @@ impl App {
             foreground_cwd: ws.tabs[tab_idx]
                 .foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),
+            restore_error: terminal.restore_error.clone(),
             label: terminal.manual_label.clone(),
             agent: terminal.effective_agent_label().map(str::to_string),
             title: presentation.title,

@@ -67,13 +67,15 @@ impl ClientShellState {
                 .any(|hit| hit.pane_id == target.pane_id && hit.inner_rect == target.inner_rect)
     }
 
-    pub(super) fn invalidate_link_hover(&mut self) {
+    pub(super) fn invalidate_link_hover(&mut self) -> bool {
         if self
             .link_hover
             .as_ref()
             .is_some_and(|hover| !self.link_hover_target_current(&hover.target))
         {
-            self.clear_link_hover();
+            self.clear_link_hover()
+        } else {
+            false
         }
     }
 

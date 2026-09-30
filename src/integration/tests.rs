@@ -4,6 +4,8 @@ use super::env::*;
 use super::file_ops::*;
 use super::registry::*;
 use super::targets::*;
+#[cfg(windows)]
+use super::test_support::symlink_file;
 use super::types::*;
 use super::version::*;
 use super::*;
@@ -1302,7 +1304,7 @@ fn codex_v2_integration_status_is_outdated() {
 
     assert_eq!(codex.path, hook_path);
     assert_eq!(codex.installed_version, Some(2));
-    assert_eq!(codex.expected_version, 8);
+    assert_eq!(codex.expected_version, 9);
     assert_eq!(codex.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");
@@ -1333,10 +1335,20 @@ fn install_codex_writes_hook_and_updates_hooks_and_config() {
         .as_str()
         .unwrap()
         .contains(" session"));
-    assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
+    assert!(hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .contains(" working"));
     assert!(hooks["hooks"].get("PreToolUse").is_none());
     assert!(hooks["hooks"].get("PermissionRequest").is_none());
-    assert!(hooks["hooks"].get("Stop").is_none());
+    assert!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .contains(" idle"));
+    assert!(hooks["hooks"]["Interrupt"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .contains(" idle"));
     assert!(config.contains("model = \"gpt-5.4\""));
     assert!(config.contains("[features]"));
     assert!(config.contains("hooks = true"));
@@ -1387,10 +1399,14 @@ fn install_codex_is_idempotent_for_hook_entries_and_feature_flag() {
     let config = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
 
     assert_eq!(hooks["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
-    assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
+    assert_eq!(
+        hooks["hooks"]["UserPromptSubmit"].as_array().unwrap().len(),
+        1
+    );
     assert!(hooks["hooks"].get("PreToolUse").is_none());
     assert!(hooks["hooks"].get("PermissionRequest").is_none());
-    assert!(hooks["hooks"].get("Stop").is_none());
+    assert_eq!(hooks["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    assert_eq!(hooks["hooks"]["Interrupt"].as_array().unwrap().len(), 1);
     assert_eq!(config.matches("hooks = true").count(), 1);
     assert!(!config.contains("codex_hooks"));
     assert!(config.contains("other = true"));
@@ -1442,7 +1458,8 @@ fn uninstall_codex_removes_herdr_hooks_and_leaves_config_alone() {
             ]}],
             "PreToolUse": [{"hooks": [{"type": "command", "command": format!("bash '{}' working", hook_path.display()), "timeout": 10}]}],
             "PermissionRequest": [{"hooks": [{"type": "command", "command": format!("bash '{}' blocked", hook_path.display()), "timeout": 10}]}],
-            "Stop": [{"hooks": [{"type": "command", "command": format!("bash '{}' idle", hook_path.display()), "timeout": 10}]}]
+            "Stop": [{"hooks": [{"type": "command", "command": format!("bash '{}' idle", hook_path.display()), "timeout": 10}]}],
+            "Interrupt": [{"hooks": [{"type": "command", "command": format!("bash '{}' idle", hook_path.display()), "timeout": 10}]}]
         }
     });
     fs::write(
@@ -1469,6 +1486,7 @@ fn uninstall_codex_removes_herdr_hooks_and_leaves_config_alone() {
     assert!(hooks["hooks"].get("PreToolUse").is_none());
     assert!(hooks["hooks"].get("PermissionRequest").is_none());
     assert!(hooks["hooks"].get("Stop").is_none());
+    assert!(hooks["hooks"].get("Interrupt").is_none());
     assert_eq!(
         hooks["hooks"]["UserPromptSubmit"][0]["hooks"]
             .as_array()
@@ -2326,6 +2344,69 @@ fn install_opencode_writes_server_and_tui_plugins() {
     let _ = fs::remove_dir_all(base);
 }
 
+#[cfg(unix)]
+#[test]
+fn opencode_reuses_json_registration_in_symlinked_config_directory() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let dotfiles = base.join("dotfiles");
+    let dir = home.join(".config/opencode");
+    fs::create_dir_all(home.join(".config")).unwrap();
+    fs::create_dir_all(&dotfiles).unwrap();
+    std::os::unix::fs::symlink(&dotfiles, &dir).unwrap();
+    std::env::set_var("HOME", &home);
+    let json_path = dir.join("tui.json");
+    let original = "{\n  // User preferences\n  \"theme\":\"system\",\n  \"plugin\":[\"other\",[\"./herdr-tui-session.js\",{\"enabled\":true}]]\n}\n";
+    fs::write(&json_path, original).unwrap();
+
+    for _ in 0..2 {
+        let installed = install_opencode().unwrap();
+        assert_eq!(installed.tui_config_path, json_path);
+        assert!(installed.cli_config_path.is_none());
+        assert!(!dir.join("tui.jsonc").exists());
+        assert_eq!(fs::read_to_string(&json_path).unwrap(), original);
+        assert_eq!(
+            integration_status_at(
+                crate::api::schema::IntegrationTarget::Opencode,
+                installed.plugin_path,
+                OPENCODE_INTEGRATION_VERSION,
+            )
+            .state,
+            IntegrationStatusKind::Current
+        );
+    }
+
+    // Older installs may have registered the same plugin in both files.
+    let jsonc_path = dir.join("tui.jsonc");
+    fs::write(
+        &jsonc_path,
+        r#"{"plugin":["./herdr-tui-session.js","another"]}"#,
+    )
+    .unwrap();
+    assert_eq!(install_opencode().unwrap().tui_config_path, jsonc_path);
+    let result = uninstall_opencode().unwrap();
+    assert_eq!(
+        result.updated_tui_configs,
+        vec![jsonc_path.clone(), json_path.clone()]
+    );
+    let json = fs::read_to_string(&json_path).unwrap();
+    assert!(json.contains("// User preferences"));
+    assert!(!json.contains("herdr-tui-session.js"));
+    assert!(json.contains("\"other\""));
+    assert!(json.contains("\"system\""));
+    assert_eq!(
+        serde_json::from_str::<Value>(&fs::read_to_string(jsonc_path).unwrap()).unwrap(),
+        json!({"plugin":["another"]})
+    );
+    assert!(uninstall_opencode().unwrap().updated_tui_configs.is_empty());
+    assert_eq!(fs::read_link(&dir).unwrap(), dotfiles);
+    assert!(!result.plugin_path.exists());
+    assert!(!result.tui_plugin_path.exists());
+    std::env::remove_var("HOME");
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn opencode_install_defers_v2_registration_while_migration_pending() {
     let _lock = integration_env_lock();
@@ -2396,6 +2477,126 @@ fn opencode_v2_install_status_and_uninstall_preserve_cli_preferences() {
 }
 
 #[test]
+fn opencode_hard_link_rejection_precedes_install_and_uninstall_asset_changes() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let dir = home.join(".config/opencode");
+    fs::create_dir_all(dir.join("plugins")).unwrap();
+    std::env::set_var("HOME", &home);
+    let plugin = dir.join("plugins").join(OPENCODE_PLUGIN_INSTALL_NAME);
+    fs::write(&plugin, "previous integration").unwrap();
+    let config = dir.join("cli.json");
+    let original = r#"{"plugins":["./herdr-opencode"],"theme":"system"}"#;
+    fs::write(&config, original).unwrap();
+    let alias = base.join("linked-config");
+    fs::hard_link(&config, &alias).unwrap();
+    let target = crate::api::schema::IntegrationTarget::Opencode;
+    for error in [
+        install_target(target).unwrap_err(),
+        uninstall_target(target).unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("multiple hard links"));
+        assert!(error.to_string().contains("cli.json"));
+    }
+    assert_eq!(fs::read_to_string(&plugin).unwrap(), "previous integration");
+    assert_eq!(fs::read_to_string(&alias).unwrap(), original);
+    assert_eq!(crate::platform::config_file_link_count(&config).unwrap(), 2);
+    assert!(!dir.join("tui.jsonc").exists());
+    assert!(!dir.join(OPENCODE_V2_TUI_PLUGIN_DIR).exists());
+    std::env::remove_var("HOME");
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn opencode_json_config_validation_precedes_asset_changes() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let dir = home.join(".config/opencode");
+    fs::create_dir_all(dir.join("plugins")).unwrap();
+    std::env::set_var("HOME", &home);
+    let plugin = dir.join("plugins").join(OPENCODE_PLUGIN_INSTALL_NAME);
+    fs::write(&plugin, "previous integration").unwrap();
+    let config = dir.join("tui.json");
+    fs::write(&config, r#"{"plugin":{}}"#).unwrap();
+    assert!(install_opencode()
+        .unwrap_err()
+        .to_string()
+        .contains("plugin list"));
+    assert_eq!(fs::read_to_string(&plugin).unwrap(), "previous integration");
+    let original = r#"{"plugin":["./herdr-tui-session.js"]}"#;
+    fs::write(&config, original).unwrap();
+    let alias = base.join("linked-config");
+    fs::hard_link(&config, &alias).unwrap();
+    for error in [
+        install_opencode().unwrap_err(),
+        uninstall_opencode().unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("multiple hard links"));
+        assert!(error.to_string().contains("tui.json"));
+    }
+    assert_eq!(fs::read_to_string(&plugin).unwrap(), "previous integration");
+    assert_eq!(fs::read_to_string(&alias).unwrap(), original);
+    assert!(!dir.join("tui.jsonc").exists());
+    assert!(!dir.join(OPENCODE_TUI_PLUGIN_INSTALL_NAME).exists());
+    std::env::remove_var("HOME");
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn opencode_recovery_copy_blocks_retry_before_parsing_or_asset_changes() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let dir = home.join(".config/opencode");
+    fs::create_dir_all(dir.join("plugins")).unwrap();
+    std::env::set_var("HOME", &home);
+    let plugin = dir.join("plugins").join(OPENCODE_PLUGIN_INSTALL_NAME);
+    fs::write(&plugin, "previous integration").unwrap();
+    let config = dir.join("cli.json");
+    let backup = dir.join("cli.json.herdr-backup");
+    let original = r#"{"plugins":["./herdr-opencode"],"theme":"system"}"#;
+    fs::write(&backup, original).unwrap();
+    let target = crate::api::schema::IntegrationTarget::Opencode;
+    for contents in [Some("{"), Some(original), None] {
+        if let Some(contents) = contents {
+            fs::write(&config, contents).unwrap();
+        } else {
+            fs::remove_file(&config).unwrap();
+        }
+        for error in [
+            install_target(target).unwrap_err(),
+            uninstall_target(target).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("recovery copy"), "{error}");
+            assert!(error.to_string().contains("cli.json.herdr-backup"));
+        }
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        if contents.is_none() {
+            assert!(!config.exists());
+        }
+    }
+    // A symlink invocation must discover the referent's recovery copy too.
+    let referent = base.join("preferences.json");
+    fs::write(&referent, "{").unwrap();
+    let linked_backup = base.join("preferences.json.herdr-backup");
+    fs::rename(&backup, &linked_backup).unwrap();
+    if symlink_file(&referent, &config) {
+        let link_before = fs::read_link(&config).unwrap();
+        let error = install_target(target).unwrap_err();
+        assert!(error.to_string().contains("preferences.json.herdr-backup"));
+        assert_eq!(fs::read_link(&config).unwrap(), link_before);
+    }
+    assert_eq!(fs::read_to_string(&plugin).unwrap(), "previous integration");
+    assert!(!dir.join("tui.jsonc").exists());
+    assert!(!dir.join(OPENCODE_V2_TUI_PLUGIN_DIR).exists());
+    std::env::remove_var("HOME");
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn opencode_invalid_cli_config_does_not_overwrite_existing_plugins() {
     let _lock = integration_env_lock();
     let base = unique_base();
@@ -2456,12 +2657,15 @@ fn uninstall_opencode_removes_plugins_and_managed_tui_config_entry() {
 
     assert!(result.removed_plugin);
     assert!(result.removed_tui_plugin);
-    assert!(result.updated_tui_config);
+    assert_eq!(
+        result.updated_tui_configs,
+        vec![installed.tui_config_path.clone()]
+    );
     assert!(!result.plugin_path.exists());
     assert!(!result.tui_plugin_path.exists());
-    assert!(result.tui_config_path.exists());
+    assert!(installed.tui_config_path.exists());
     let tui_config: Value =
-        serde_json::from_str(&fs::read_to_string(&result.tui_config_path).unwrap()).unwrap();
+        serde_json::from_str(&fs::read_to_string(&installed.tui_config_path).unwrap()).unwrap();
     assert_eq!(tui_config, json!({}));
     assert_eq!(installed.plugin_path, result.plugin_path);
 
@@ -2505,6 +2709,12 @@ fn uninstall_opencode_removes_plugins_when_tui_config_is_invalid() {
     fs::write(&plugin_path, OPENCODE_PLUGIN_ASSET).unwrap();
     fs::write(&tui_plugin_path, OPENCODE_TUI_PLUGIN_ASSET).unwrap();
     fs::write(opencode_dir.join("tui.jsonc"), "{\"plugin\":").unwrap();
+    let json_path = opencode_dir.join("tui.json");
+    fs::write(
+        &json_path,
+        r#"{"plugin":["./herdr-tui-session.js","other"]}"#,
+    )
+    .unwrap();
     std::env::set_var("HOME", &home);
 
     let err = uninstall_opencode().unwrap_err().to_string();
@@ -2512,6 +2722,10 @@ fn uninstall_opencode_removes_plugins_when_tui_config_is_invalid() {
     assert!(err.contains("failed to parse OpenCode TUI config"));
     assert!(!plugin_path.exists());
     assert!(!tui_plugin_path.exists());
+    assert_eq!(
+        serde_json::from_str::<Value>(&fs::read_to_string(json_path).unwrap()).unwrap(),
+        json!({"plugin":["other"]})
+    );
 
     std::env::remove_var("HOME");
     let _ = fs::remove_dir_all(base);

@@ -263,7 +263,6 @@ fn ctrl_hover_preserves_fast_patches_for_other_panes() {
     ));
     assert!(!state.link_hover.as_ref().unwrap().regions.is_empty());
 }
-
 #[test]
 fn ctrl_hover_ignores_late_reply_after_pointer_leaves() {
     let mut state = hover_state();

@@ -24,6 +24,7 @@ macro_rules! println {
 
 mod agent;
 mod api;
+mod clipboard;
 mod completion;
 mod integration;
 mod machine;
@@ -130,6 +131,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "plugin" => plugin::run_plugin_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
+        "clipboard" => clipboard::run_clipboard_command(&args[2..])?,
         _ => return Ok(CommandOutcome::NotCli),
     };
 
@@ -782,8 +784,7 @@ pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde
 }
 
 fn ensure_server_protocol_compatible(client: &ApiClient, request_id: &str) -> std::io::Result<()> {
-    let status = client
-        .status()
+    let status = target::server_status(client)
         .map_err(|err| map_server_not_running_or_io(err, request_id, client))?;
     let server_protocol = status
         .protocol
@@ -999,7 +1000,9 @@ fn print_session_table(sessions: &[crate::session::SessionInfo]) {
         println!(
             "{:<20} {:<8} {:<48} {}",
             session.name,
-            if session.running {
+            if session.connection_error.is_some() {
+                "unavailable"
+            } else if session.running {
                 "running"
             } else {
                 "stopped"
@@ -1007,6 +1010,9 @@ fn print_session_table(sessions: &[crate::session::SessionInfo]) {
             session.session_dir,
             session.socket_path
         );
+        if let Some(error) = &session.connection_error {
+            println!("  {error}");
+        }
     }
 }
 
@@ -1183,5 +1189,24 @@ mod tests {
                 "5000",
             ]
         );
+    }
+
+    #[test]
+    fn bare_client_arg_passes_through_as_not_cli() {
+        let args = vec!["herdr".to_string(), "client".to_string()];
+        let outcome = super::maybe_run(&args).unwrap();
+        assert!(matches!(outcome, super::CommandOutcome::NotCli));
+    }
+
+    #[test]
+    fn clipboard_set_help_is_handled() {
+        let args = vec![
+            "herdr".to_string(),
+            "clipboard".to_string(),
+            "set".to_string(),
+            "--help".to_string(),
+        ];
+        let outcome = super::maybe_run(&args).unwrap();
+        assert!(matches!(outcome, super::CommandOutcome::Handled(0)));
     }
 }

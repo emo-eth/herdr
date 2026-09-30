@@ -51,7 +51,8 @@ use crate::server::client_accept::{
     accept_pending_client_connections, reject_pending_client_connections,
 };
 use crate::server::client_shell::{
-    render_pane_surface as render_client_shell_pane_surface, snapshot as client_shell_snapshot,
+    render_pane_surface as render_client_shell_pane_surface,
+    snapshot_with_completions as client_shell_snapshot,
 };
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
@@ -75,11 +76,16 @@ mod bootstrap;
 mod client_views;
 mod endpoint_requests;
 mod lifecycle;
+mod native_graphics;
 mod notifications;
-mod pane_graphics;
 mod render;
 mod retained_surface;
 mod surface_interest;
+
+// Producers can refill even a bounded channel while it is being drained.
+// Yield to scheduled work and rendering between batches; select! below
+// immediately wakes for any messages left in either external queue.
+const EXTERNAL_EVENT_DRAIN_LIMIT: usize = 64;
 
 pub use bootstrap::run_server;
 use lifecycle::wait_for_live_handoff_response_write;
@@ -131,29 +137,14 @@ enum LoopEvent {
     RenderRequested,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+/// Presentation work caused by a server event.
+///
+/// Keeping this classification separate from event delivery makes the input
+/// contract explicit: events may reach a PTY without necessarily repainting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenderImpact {
-    #[default]
     None,
-    Graphics,
     Full,
-}
-
-impl RenderImpact {
-    fn merge(&mut self, other: Self) {
-        *self = (*self).max(other);
-    }
-}
-
-fn record_render_impact(source: &'static str, impact: RenderImpact) {
-    let event = match (source, impact) {
-        ("api_requests", RenderImpact::Graphics) => "graphics_render_cause.api_requests",
-        ("api_requests", RenderImpact::Full) => "full_render_cause.api_requests",
-        ("server_events", RenderImpact::Graphics) => "graphics_render_cause.server_events",
-        ("server_events", RenderImpact::Full) => "full_render_cause.server_events",
-        _ => return,
-    };
-    crate::render_prof::event(event);
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +195,7 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
+    native_graphics: native_graphics::NativeGraphics,
     #[cfg(unix)]
     next_client_id: u64,
     /// The client currently driving session-wide host presentation and side effects.
@@ -250,6 +242,7 @@ pub struct HeadlessServer {
     pending_handoff_repaint_nudge: bool,
     /// Flag set by Ctrl+C or `server stop` signal.
     should_quit: Arc<AtomicBool>,
+    host_shutdown_requested: Arc<AtomicBool>,
     /// Channel for receiving server events from client connection threads.
     server_event_rx: mpsc::Receiver<ServerEvent>,
     /// Sender for server events (cloned for each client thread).
@@ -348,6 +341,7 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
+            native_graphics: Default::default(),
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -373,6 +367,7 @@ impl HeadlessServer {
             headless_size,
             effective_size: headless_size,
             shutting_down: false,
+            host_shutdown_requested: Arc::new(AtomicBool::new(false)),
             handoff_in_progress: false,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
@@ -398,6 +393,13 @@ impl HeadlessServer {
         let should_quit = self.should_quit.clone();
         let quit_notify = self.server_event_tx.clone();
         ctrlc_handler(should_quit, quit_notify);
+        let quit_notify = self.server_event_tx.clone();
+        let _host_shutdown = crate::platform::HostShutdownMonitor::start(
+            self.host_shutdown_requested.clone(),
+            move || {
+                let _ = quit_notify.try_send(ServerEvent::QuitSignal);
+            },
+        );
 
         let mut needs_render = true;
         let mut needs_full_render = true;
@@ -412,6 +414,13 @@ impl HeadlessServer {
             if self.shutting_down {
                 self.complete_shutdown().await?;
                 break;
+            }
+
+            // A host shutdown warning precedes process termination. Do not drain pane
+            // deaths here: logind's delay lock stays held until the final session save.
+            if self.host_shutdown_requested.load(Ordering::Acquire) {
+                self.initiate_shutdown();
+                continue;
             }
 
             // Check if we should start shutting down.
@@ -446,22 +455,7 @@ impl HeadlessServer {
             }
 
             // 3. Drain API requests.
-            if self.pane_graphics_runtime_active() {
-                let api_impact = self.drain_api_requests_with_render_impact();
-                record_render_impact("api_requests", api_impact);
-                match api_impact {
-                    RenderImpact::None => {}
-                    RenderImpact::Graphics => {
-                        needs_render = true;
-                        needs_graphics_render = true;
-                    }
-                    RenderImpact::Full => {
-                        needs_render = true;
-                        needs_full_render = true;
-                        needs_graphics_render = false;
-                    }
-                }
-            } else if self.drain_api_requests_with_shutdown_check() {
+            if self.drain_api_requests_with_shutdown_check() {
                 needs_render = true;
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.api_requests");
@@ -477,22 +471,7 @@ impl HeadlessServer {
             self.accept_client_connections()?;
 
             // 5. Drain server events from client threads.
-            if self.pane_graphics_runtime_active() {
-                let server_impact = self.drain_server_events_with_render_impact();
-                record_render_impact("server_events", server_impact);
-                match server_impact {
-                    RenderImpact::None => {}
-                    RenderImpact::Graphics => {
-                        needs_render = true;
-                        needs_graphics_render = true;
-                    }
-                    RenderImpact::Full => {
-                        needs_render = true;
-                        needs_full_render = true;
-                        needs_graphics_render = false;
-                    }
-                }
-            } else if self.drain_server_events() {
+            if self.drain_server_events() {
                 needs_render = true;
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.server_events");
@@ -524,19 +503,25 @@ impl HeadlessServer {
                 crate::render_prof::event("full_render_cause.default_workspace");
             }
 
-            if self.retain_live_pane_graphics() {
+            if self.expire_native_graphics(now) {
                 needs_render = true;
-                needs_graphics_render = true;
-            }
-            if self.expire_direct_graphics(now) {
-                needs_render = true;
-                needs_graphics_render = true;
+                needs_full_render = true;
+                needs_graphics_render = false;
             }
 
             self.drain_client_config_reload_request();
             self.sync_immediate_pty_sources();
             self.stream_host_mouse_capture_mode();
             self.stream_direct_terminal_keyboard_mode();
+
+            if self
+                .clients
+                .values()
+                .any(|client| client.pending_raw_shell_snapshot.is_some())
+            {
+                needs_render = true;
+                needs_full_render = true;
+            }
 
             // 7. Render virtually and stream frames. Hidden-only PTY work keeps a
             // bounded classification cadence without delaying presentation work
@@ -638,7 +623,9 @@ impl HeadlessServer {
                 }
             };
 
-            if self.should_quit.load(Ordering::Acquire) {
+            if self.should_quit.load(Ordering::Acquire)
+                || self.host_shutdown_requested.load(Ordering::Acquire)
+            {
                 match event {
                     LoopEvent::Internal(ev) => {
                         self.handle_internal_event_with_forwarding(ev);
@@ -670,43 +657,13 @@ impl HeadlessServer {
                     }
                 }
                 LoopEvent::Api(msg) => {
-                    if self.pane_graphics_runtime_active() {
-                        let impact = self.handle_api_request_with_render_impact(*msg);
-                        record_render_impact("api_requests", impact);
-                        match impact {
-                            RenderImpact::None => {}
-                            RenderImpact::Graphics => {
-                                needs_render = true;
-                                needs_graphics_render = true;
-                            }
-                            RenderImpact::Full => {
-                                needs_render = true;
-                                needs_full_render = true;
-                                needs_graphics_render = false;
-                            }
-                        }
-                    } else if self.handle_api_request_with_shutdown_check(*msg) {
+                    if self.handle_api_request_with_shutdown_check(*msg) {
                         needs_render = true;
                         needs_full_render = true;
                     }
                 }
                 LoopEvent::ServerEvent(ev) => {
-                    if self.pane_graphics_runtime_active() {
-                        let impact = self.handle_server_event_with_render_impact(ev);
-                        record_render_impact("server_events", impact);
-                        match impact {
-                            RenderImpact::None => {}
-                            RenderImpact::Graphics => {
-                                needs_render = true;
-                                needs_graphics_render = true;
-                            }
-                            RenderImpact::Full => {
-                                needs_render = true;
-                                needs_full_render = true;
-                                needs_graphics_render = false;
-                            }
-                        }
-                    } else if self.handle_server_event(ev) {
+                    if self.handle_server_event_with_render_impact(ev) == RenderImpact::Full {
                         needs_render = true;
                         needs_full_render = true;
                     }
@@ -779,7 +736,7 @@ impl HeadlessServer {
         // rendering semantics. Force one fresh frame to every remaining client
         // even if the next rendered buffer compares equal to its cached frame.
         for client in self.clients.values_mut() {
-            client.request_repaint();
+            client.request_recompute();
         }
         if !start_pending_agent_resumes {
             self.app.pending_agent_resume_deadline = None;
@@ -789,10 +746,10 @@ impl HeadlessServer {
         self.app.sync_pending_agent_resume_deadline(now);
         if self
             .app
-            .start_pending_agent_resumes(self.app.pending_agent_resume_due(now))
+            .start_pending_agent_resumes(now, self.app.pending_agent_resume_due(now))
         {
             for client in self.clients.values_mut() {
-                client.request_repaint();
+                client.request_recompute();
             }
         }
     }
@@ -805,36 +762,55 @@ impl HeadlessServer {
         );
     }
 
-    fn sync_foreground_client_state(&mut self) {
-        self.app.direct_graphics_available = self.direct_graphics_available();
-        self.app.pixel_mouse_available = self.foreground_client_id.is_some_and(|id| {
+    fn sync_foreground_client_state(&mut self) -> bool {
+        let mut visual_changed = false;
+        let pixel_mouse = self.foreground_client_id.is_some_and(|id| {
             self.clients
                 .get(&id)
                 .is_some_and(|client| client.pixel_mouse)
         });
-        if !self.app.direct_graphics_available {
-            self.retire_all_direct_graphics();
+        if self.app.pixel_mouse_available != pixel_mouse {
+            self.app.pixel_mouse_available = pixel_mouse;
+            visual_changed = true;
         }
         let Some(client_id) = self.foreground_client_id else {
-            self.effective_size = self.headless_size;
-            self.app.state.outer_terminal_focus = None;
-            self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+            if self.effective_size != self.headless_size {
+                self.effective_size = self.headless_size;
+                visual_changed = true;
+            }
+            if self.app.state.outer_terminal_focus.is_some() {
+                self.app.state.outer_terminal_focus = None;
+                visual_changed = true;
+            }
+            if self.app.state.host_cell_size != crate::kitty_graphics::HostCellSize::default() {
+                self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+                visual_changed = true;
+            }
             self.sync_runtime_view_geometry();
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
             self.sync_visible_server_config_diagnostic(false);
-            return;
+            return visual_changed;
         };
         let Some(client) = self.clients.get(&client_id) else {
             self.foreground_client_id = None;
-            self.effective_size = self.headless_size;
-            self.app.state.outer_terminal_focus = None;
-            self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+            if self.effective_size != self.headless_size {
+                self.effective_size = self.headless_size;
+                visual_changed = true;
+            }
+            if self.app.state.outer_terminal_focus.is_some() {
+                self.app.state.outer_terminal_focus = None;
+                visual_changed = true;
+            }
+            if self.app.state.host_cell_size != crate::kitty_graphics::HostCellSize::default() {
+                self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+                visual_changed = true;
+            }
             self.sync_runtime_view_geometry();
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
             self.sync_visible_server_config_diagnostic(false);
-            return;
+            return visual_changed;
         };
 
         let terminal_size = client.terminal_size;
@@ -849,21 +825,31 @@ impl HeadlessServer {
         let host_terminal_appearance_explicit = client.host_terminal_appearance_explicit;
         let outer_terminal_focus = client.outer_terminal_focus;
 
-        self.effective_size = terminal_size;
+        if self.effective_size != terminal_size {
+            self.effective_size = terminal_size;
+            visual_changed = true;
+        }
         self.sync_runtime_view_geometry();
-        self.app.state.outer_terminal_focus = outer_terminal_focus;
-        self.app.state.host_cell_size = host_cell_size;
+        if self.app.state.outer_terminal_focus != outer_terminal_focus {
+            self.app.state.outer_terminal_focus = outer_terminal_focus;
+            visual_changed = true;
+        }
+        if self.app.state.host_cell_size != host_cell_size {
+            self.app.state.host_cell_size = host_cell_size;
+            visual_changed = true;
+        }
         let server_keybindings = self.server_keybindings.clone();
         apply_keybindings(&mut self.app, &server_keybindings);
         self.sync_visible_server_config_diagnostic(false);
         if outer_terminal_focus == Some(true) {
-            self.app.state.mark_active_tab_seen();
+            visual_changed |= self.app.state.mark_active_tab_seen();
         }
-        self.app.set_host_terminal_appearance_state(
+        visual_changed |= self.app.set_host_terminal_appearance_state(
             host_terminal_appearance,
             host_terminal_appearance_explicit,
         );
-        self.app.set_host_terminal_theme(host_terminal_theme);
+        visual_changed |= self.app.set_host_terminal_theme(host_terminal_theme);
+        visual_changed
     }
 
     fn sync_visible_server_config_diagnostic(&mut self, uses_local_keybindings: bool) {
@@ -925,12 +911,11 @@ impl HeadlessServer {
 
     fn promote_latest_remaining_client(&mut self) -> bool {
         let next_foreground = latest_shell_client(&self.clients);
-        let changed = next_foreground != self.foreground_client_id;
+        let changed = self.foreground_client_id != next_foreground;
         self.foreground_client_id = next_foreground;
         self.sync_foreground_client_state();
         changed
     }
-
     fn app_client_count(&self) -> usize {
         self.clients
             .values()
@@ -947,53 +932,12 @@ impl HeadlessServer {
         })
     }
 
-    fn existing_direct_graphics_client(&self) -> Option<u64> {
-        self.app
-            .pane_graphics
-            .slots
-            .values()
-            .filter_map(crate::app::pane_graphics::Slot::direct_client)
-            .filter_map(|client_id| {
-                let client = self.clients.get(&client_id)?;
-                self.client_supports_direct_graphics(client_id)
-                    .then_some((client.last_activity, client_id))
-            })
-            .max()
-            .map(|(_, client_id)| client_id)
-    }
-
-    fn direct_graphics_client(&self) -> Option<u64> {
-        self.existing_direct_graphics_client().or_else(|| {
-            self.foreground_client_id
-                .filter(|client_id| self.client_supports_direct_graphics(*client_id))
-        })
-    }
-
-    fn direct_graphics_client_for_key(&self, key: &crate::app::pane_graphics::Key) -> Option<u64> {
-        match self
-            .app
-            .pane_graphics
-            .slots
-            .get(key)
-            .and_then(crate::app::pane_graphics::Slot::direct_client)
-        {
-            Some(client_id) => self
-                .client_supports_direct_graphics(client_id)
-                .then_some(client_id),
-            None => self.direct_graphics_client(),
-        }
-    }
-
-    fn direct_graphics_available(&self) -> bool {
-        self.direct_graphics_client().is_some()
-    }
-
     fn has_app_client(&self) -> bool {
         self.app_client_count() > 0
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
-        self.retire_direct_graphics_for_client(client_id);
+        self.disconnect_native_graphics(client_id);
         let disconnected_focus = self
             .clients
             .get(&client_id)
@@ -1033,7 +977,6 @@ impl HeadlessServer {
                 self.send_shell_focus_target(target, crate::ghostty::FocusEvent::Lost);
             }
         }
-        self.app.direct_graphics_available = self.direct_graphics_available();
         if was_foreground {
             self.promote_latest_remaining_client()
         } else {
@@ -1112,29 +1055,18 @@ impl HeadlessServer {
     }
 
     /// Drains server events from the dedicated channel.
-    ///
-    /// Uses the original full-render semantics when pane graphics are dormant.
     fn drain_server_events(&mut self) -> bool {
         let mut changed = false;
-        while !self.should_quit.load(Ordering::Acquire) {
+        for _ in 0..EXTERNAL_EVENT_DRAIN_LIMIT {
+            if self.should_quit.load(Ordering::Acquire) {
+                break;
+            }
             let Ok(ev) = self.server_event_rx.try_recv() else {
                 break;
             };
-            changed |= self.handle_server_event(ev);
+            changed |= self.handle_server_event_with_render_impact(ev) == RenderImpact::Full;
         }
         changed
-    }
-
-    /// Returns the strongest render impact from the drained event batch.
-    fn drain_server_events_with_render_impact(&mut self) -> RenderImpact {
-        let mut impact = RenderImpact::None;
-        while !self.should_quit.load(Ordering::Acquire) {
-            let Ok(ev) = self.server_event_rx.try_recv() else {
-                break;
-            };
-            impact.merge(self.handle_server_event_with_render_impact(ev));
-        }
-        impact
     }
 
     async fn reject_late_client_connections(&mut self) {
@@ -1270,7 +1202,9 @@ impl HeadlessServer {
                     return false;
                 }
                 let foreground_changed = self.promote_client_to_foreground(client_id);
-                let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
+                let geometry_changed = self
+                    .claim_shell_tab_geometry_with_change(client_id, false)
+                    .unwrap_or(false);
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
                     workspace_index,
@@ -1310,7 +1244,9 @@ impl HeadlessServer {
                     return false;
                 }
                 let foreground_changed = self.promote_client_to_foreground(client_id);
-                let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
+                let geometry_changed = self
+                    .claim_shell_tab_geometry_with_change(client_id, false)
+                    .unwrap_or(false);
                 let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
                     return foreground_changed | geometry_changed;
                 };
@@ -1614,6 +1550,28 @@ impl HeadlessServer {
             result: ResponseResult::ClientWindowTitle { changed, reason },
         })
         .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn handle_client_clipboard_set_api(&mut self, id: String, text: &str) -> String {
+        use api::schema::ResponseResult;
+
+        let data = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        if self.send_to_foreground_client(ServerMessage::Clipboard { data }) {
+            serde_json::to_string(&api::schema::SuccessResponse {
+                id,
+                result: ResponseResult::ClientClipboardSet { delivered: true },
+            })
+            .unwrap_or_else(|_| "{}".to_string())
+        } else {
+            serde_json::to_string(&api::schema::ErrorResponse {
+                id,
+                error: api::schema::ErrorBody {
+                    code: "no_foreground_client".into(),
+                    message: "no foreground client connected".into(),
+                },
+            })
+            .unwrap_or_else(|_| "{}".to_string())
+        }
     }
 
     fn drain_client_config_reload_request(&mut self) {
@@ -1968,6 +1926,11 @@ impl HeadlessServer {
                 endpoint_keybindings,
                 mouse_capture,
                 surface_active,
+                surface_reuse,
+                surface_delta,
+                surface_scroll,
+                snapshot_codec,
+                surface_codec,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -2013,13 +1976,20 @@ impl HeadlessServer {
                 connection.shell_uses_endpoint_keybindings = endpoint_keybindings;
                 connection.shell_mouse_capture = mouse_capture;
                 connection.shell_surface_active = surface_active;
+                connection.render_state.enable_surface_reuse(surface_reuse);
+                connection.render_state.enable_surface_delta(surface_delta);
+                connection
+                    .render_state
+                    .enable_surface_scroll(surface_scroll);
+                connection.snapshot_codec = snapshot_codec;
+                connection.surface_codec = surface_codec;
                 connection.shell_projection_revision = 1;
                 let config_diagnostic = if endpoint_keybindings {
                     self.server_config_diagnostic.as_deref()
                 } else {
                     self.server_config_diagnostic_without_keybindings.as_deref()
                 };
-                let seed_snapshot = client_shell_snapshot(
+                let (seed_snapshot, completion_projection) = client_shell_snapshot(
                     &self.app,
                     &self.client_shell_boot_id,
                     connection.shell_projection_revision,
@@ -2051,8 +2021,18 @@ impl HeadlessServer {
                             return false;
                         }
                     };
+                let completion_message = match crate::protocol::endpoint::agent_completions_message(
+                    &completion_projection,
+                ) {
+                    Ok(message) => message,
+                    Err(err) => {
+                        warn!(client_id, err = %err, "failed to encode agent completions");
+                        return false;
+                    }
+                };
                 connection.shell_location = Some(location);
                 connection.shell_snapshot = Some(seed_snapshot);
+                connection.shell_agent_completions = Some(completion_projection);
                 connection.shell_agent_view = agent_view;
                 self.clients.insert(client_id, connection);
                 if self.app.state.popup_pane.is_some() && self.popup_owner_tab_id.is_none() {
@@ -2061,6 +2041,7 @@ impl HeadlessServer {
                 if let Some(message) = projection_message {
                     self.send_to_client(client_id, message);
                 }
+                self.send_to_client(client_id, completion_message);
                 self.send_to_client(client_id, snapshot_message);
                 if surface_active {
                     self.foreground_client_id = Some(client_id);
@@ -2078,12 +2059,17 @@ impl HeadlessServer {
                 transfer_id,
                 image_id,
                 success,
-            } => self.complete_direct_graphics(client_id, transfer_id, image_id, success),
+            } => self
+                .native_result(client_id, transfer_id, image_id, success)
+                .unwrap_or(false),
             ServerEvent::GraphicsTransmissionStarted {
                 client_id,
                 transfer_id,
                 image_id,
-            } => self.start_direct_graphics_response(client_id, transfer_id, image_id),
+            } => {
+                self.native_started(client_id, transfer_id, image_id);
+                false
+            }
             ServerEvent::ClientAttachTerminal {
                 client_id,
                 terminal_id,
@@ -2466,8 +2452,10 @@ impl HeadlessServer {
                 }
                 let foreground_changed =
                     interaction && self.promote_client_to_foreground(client_id);
-                let geometry_changed =
-                    interaction && self.claim_shell_tab_geometry(client_id, false);
+                let geometry_changed = interaction
+                    && self
+                        .claim_shell_tab_geometry_with_change(client_id, false)
+                        .unwrap_or(false);
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
                     workspace_index,
@@ -2548,8 +2536,10 @@ impl HeadlessServer {
                 }
                 let foreground_changed =
                     interaction && self.promote_client_to_foreground(client_id);
-                let geometry_changed =
-                    interaction && self.claim_shell_tab_geometry(client_id, false);
+                let geometry_changed = interaction
+                    && self
+                        .claim_shell_tab_geometry_with_change(client_id, false)
+                        .unwrap_or(false);
                 let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
                     return foreground_changed | geometry_changed;
                 };
@@ -2885,7 +2875,10 @@ impl HeadlessServer {
     /// During shutdown, remaining requests get a `server_unavailable` error.
     fn drain_api_requests_with_shutdown_check(&mut self) -> bool {
         let mut changed = false;
-        while !self.should_quit.load(Ordering::Acquire) {
+        for _ in 0..EXTERNAL_EVENT_DRAIN_LIMIT {
+            if self.should_quit.load(Ordering::Acquire) {
+                break;
+            }
             let Ok(msg) = self.app.api_rx.try_recv() else {
                 break;
             };
@@ -2903,39 +2896,11 @@ impl HeadlessServer {
         }
     }
 
-    fn drain_api_requests_with_render_impact(&mut self) -> RenderImpact {
-        let mut impact = RenderImpact::None;
-        while !self.should_quit.load(Ordering::Acquire) {
-            let Ok(msg) = self.app.api_rx.try_recv() else {
-                break;
-            };
-            impact.merge(self.handle_api_request_with_render_impact(msg));
-        }
-        impact
-    }
-
-    fn handle_api_request_with_render_impact(
-        &mut self,
-        msg: api::ApiRequestMessage,
-    ) -> RenderImpact {
-        if matches!(
-            &msg.request.method,
-            api::schema::Method::PaneGraphicsStreamSet(_)
-                | api::schema::Method::PaneGraphicsStreamDirect(_)
-        ) {
-            return self.handle_pane_graphics_stream_frame(msg);
-        }
-        if self.handle_api_request_with_shutdown_check(msg) {
-            RenderImpact::Full
-        } else {
-            RenderImpact::None
-        }
-    }
-
     fn handle_api_request_with_shutdown_check_inner(
         &mut self,
         msg: api::ApiRequestMessage,
         skip_default_workspace_for_request: bool,
+        client_local: bool,
     ) -> bool {
         if self.shutting_down {
             // During shutdown, respond with server_unavailable.
@@ -2964,12 +2929,6 @@ impl HeadlessServer {
         };
 
         let metadata_expired = self.app.expire_due_metadata(Instant::now());
-        let stream_open = match &msg.request.method {
-            api::schema::Method::PaneGraphicsStreamOpen(params) => Some(params.clone()),
-            _ => None,
-        };
-        let stream_active = msg.stream_active.clone();
-
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
             let handoff_result = self.perform_live_handoff(params.clone());
             let handoff_succeeded = handoff_result.is_ok();
@@ -3016,19 +2975,16 @@ impl HeadlessServer {
                 let _ = msg.respond_to.send(response);
                 return true;
             }
+            api::schema::Method::ClientClipboardSet(params) => {
+                let response =
+                    self.handle_client_clipboard_set_api(msg.request.id.clone(), &params.text);
+                let _ = msg.respond_to.send(response);
+                return true;
+            }
             _ => {}
         }
 
-        let pane_graphics_revision_before = matches!(
-            &msg.request.method,
-            api::schema::Method::PaneGraphicsSet(_)
-                | api::schema::Method::PaneGraphicsClear(_)
-                | api::schema::Method::PaneGraphicsStreamOpen(_)
-                | api::schema::Method::PaneGraphicsStreamClose(_)
-        )
-        .then_some(self.app.pane_graphics.revision());
-        let mut changed = metadata_expired
-            | (pane_graphics_revision_before.is_none() && api::request_changes_ui(&msg.request));
+        let mut changed = metadata_expired | api::request_changes_ui(&msg.request);
         let skip_default_workspace = skip_default_workspace_for_request
             || matches!(
                 &msg.request.method,
@@ -3090,12 +3046,18 @@ impl HeadlessServer {
         }
         if matches!(
             &msg.request.method,
-            api::schema::Method::WorktreeCreate(_) | api::schema::Method::WorktreeRemove(_)
+            api::schema::Method::WorktreeCreate(_)
+                | api::schema::Method::WorktreeRemove(_)
+                | api::schema::Method::WorktreeList(_)
+                | api::schema::Method::WorktreeOpen(_)
         ) {
-            let deferred_changed = self
-                .app
-                .handle_deferred_worktree_api_request(msg.request, msg.respond_to);
-            return changed | deferred_changed;
+            let read_only = matches!(&msg.request.method, api::schema::Method::WorktreeList(_));
+            let deferred_changed = self.app.handle_deferred_worktree_api_request(
+                msg.request,
+                msg.respond_to,
+                client_local,
+            );
+            return changed | (deferred_changed && !read_only);
         }
         if self.foreground_client_id.is_some_and(|client_id| {
             self.clients
@@ -3143,10 +3105,6 @@ impl HeadlessServer {
                 }
             }
         }
-        if let (Some(params), Some(active)) = (stream_open.as_ref(), stream_active) {
-            self.app
-                .attach_pane_graphics_stream_active(params, active, &response);
-        }
         if let Some(spec) = alt_screen_read_spec {
             if let Ok(success) = serde_json::from_str::<api::schema::SuccessResponse>(&response) {
                 if let api::schema::ResponseResult::PaneRead { read } = success.result {
@@ -3168,10 +3126,6 @@ impl HeadlessServer {
             }
         }
         let _ = msg.respond_to.send(response);
-
-        if let Some(revision_before) = pane_graphics_revision_before {
-            changed |= revision_before != self.app.pane_graphics.revision();
-        }
 
         // Forward new toast state only when a client-local delivery mode is selected.
         // Herdr delivery renders the toast in-frame and must not ask clients to
@@ -3219,7 +3173,10 @@ impl HeadlessServer {
             };
 
             let new_state = terminal_after.state;
-            if new_state == *prev_state {
+            if new_state == *prev_state
+                || (new_state == crate::detect::AgentState::Idle
+                    && terminal_after.last_agent_completion_seq.is_none())
+            {
                 continue;
             }
 
@@ -3252,15 +3209,11 @@ impl HeadlessServer {
                 && self.app.state.toast_config.delay_seconds == 0
                 && should_forward_toast_to_clients(self.app.state.toast_config.delivery)
             {
-                if let Some(kind) =
-                    crate::app::actions::notification_toast_for_state_change_with_agent_labels(
-                        suppress_active_tab_notifications,
-                        *prev_state,
-                        new_state,
-                        prev_agent_label.as_deref(),
-                        agent_label.as_deref(),
-                    )
-                {
+                if let Some(kind) = crate::app::actions::notification_toast_for_state_change(
+                    suppress_active_tab_notifications,
+                    *prev_state,
+                    new_state,
+                ) {
                     if let Some(agent_label) = self
                         .app
                         .state
@@ -3297,15 +3250,11 @@ impl HeadlessServer {
             // Clients still decide locally whether they can execute the side effect.
             if self.app.state.toast_config.delay_seconds == 0 && self.app.state.sound.allows(agent)
             {
-                if let Some(sound) =
-                    crate::app::actions::notification_sound_for_state_change_with_agent_labels(
-                        suppress_active_tab_notifications,
-                        *prev_state,
-                        new_state,
-                        prev_agent_label.as_deref(),
-                        agent_label.as_deref(),
-                    )
-                {
+                if let Some(sound) = crate::app::actions::notification_sound_for_state_change(
+                    suppress_active_tab_notifications,
+                    *prev_state,
+                    new_state,
+                ) {
                     debug!(sound = ?sound, "forwarding sound notification from API request");
                     self.send_notify_to_foreground_client(
                         protocol::NotifyKind::Sound,
@@ -3416,7 +3365,7 @@ impl HeadlessServer {
             self.app.sync_pending_agent_resume_deadline(now);
             changed |= self
                 .app
-                .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
+                .start_pending_agent_resumes(now, self.app.pending_agent_resume_due(now));
         }
         changed
     }

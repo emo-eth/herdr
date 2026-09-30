@@ -19,6 +19,87 @@ fn restore_mode_bar(
     }
 }
 
+fn install_pane_surface_hits(
+    hits: &mut ShellHitMap,
+    mouse_capture: bool,
+    area: Rect,
+    surface: &crate::protocol::PaneSurfaceFrame,
+) {
+    hits.panes = surface
+        .panes
+        .iter()
+        .map(|pane| PaneHit {
+            rect: Rect::new(
+                area.x.saturating_add(pane.rect.x),
+                area.y.saturating_add(pane.rect.y),
+                pane.rect.width,
+                pane.rect.height,
+            ),
+            inner_rect: Rect::new(
+                area.x.saturating_add(pane.inner_rect.x),
+                area.y.saturating_add(pane.inner_rect.y),
+                pane.inner_rect.width,
+                pane.inner_rect.height,
+            ),
+            scrollbar_rect: pane.scrollbar_rect.map(|rect| {
+                Rect::new(
+                    area.x.saturating_add(rect.x),
+                    area.y.saturating_add(rect.y),
+                    rect.width,
+                    rect.height,
+                )
+            }),
+            scroll: pane.scroll.map(|metrics| crate::pane::ScrollMetrics {
+                offset_from_bottom: usize::try_from(metrics.offset_from_bottom)
+                    .unwrap_or(usize::MAX),
+                max_offset_from_bottom: usize::try_from(metrics.max_offset_from_bottom)
+                    .unwrap_or(usize::MAX),
+                viewport_rows: usize::try_from(metrics.viewport_rows).unwrap_or(usize::MAX),
+            }),
+            pane_id: pane.pane_id.clone(),
+            content_revision: pane.content_revision,
+            popup: false,
+            mouse_reporting: pane.mouse_reporting,
+            sgr_pixel_mouse: pane.sgr_pixel_mouse,
+            pixel_width: pane.pixel_width,
+            pixel_height: pane.pixel_height,
+        })
+        .collect();
+    let topology_signature = pane_surface_topology_signature(surface);
+    hits.pane_splits = surface
+        .splits
+        .iter()
+        .map(|split| PaneSplitHit {
+            direction: split.direction,
+            pos: match split.direction {
+                crate::protocol::PaneSurfaceSplitDirection::Horizontal => {
+                    area.x.saturating_add(split.pos)
+                }
+                crate::protocol::PaneSurfaceSplitDirection::Vertical => {
+                    area.y.saturating_add(split.pos)
+                }
+            },
+            area: Rect::new(
+                area.x.saturating_add(split.area.x),
+                area.y.saturating_add(split.area.y),
+                split.area.width,
+                split.area.height,
+            ),
+            hit_rect: Rect::new(
+                area.x.saturating_add(split.hit_rect.x),
+                area.y.saturating_add(split.hit_rect.y),
+                split.hit_rect.width,
+                split.hit_rect.height,
+            ),
+            path: split.path.clone(),
+            topology_signature,
+        })
+        .collect();
+    if !mouse_capture {
+        hits.pane_splits.clear();
+    }
+}
+
 impl ClientShellState {
     fn compose_unavailable(&mut self, cols: u16, rows: u16) -> FrameData {
         let layout = self.layout(cols, rows);
@@ -40,6 +121,12 @@ impl ClientShellState {
                 .navigate_workspace_id
                 .as_ref()
                 .is_some_and(|target| self.navigation_target_valid(target));
+        let pending_workspace_highlight =
+            self.pending_workspace_highlight.as_ref().filter(|pending| {
+                self.mode != ClientShellMode::Navigate
+                    && pending.target.endpoint_id == self.active_endpoint_id
+                    && self.navigation_target_valid(&pending.target)
+            });
         // A resize invalidates pane geometry, not the healthy Local workspace chrome.
         let local_snapshot = self.snapshot.as_deref().filter(|_| {
             self.endpoints.len() == 1
@@ -49,6 +136,7 @@ impl ClientShellState {
                     == Some(ClientEndpointStatus::Online)
         });
         let mut render_state = render::ShellRenderState {
+            machine_diagnostics: &self.machine_diagnostics,
             endpoints: &self.endpoints,
             active_endpoint_id: &self.active_endpoint_id,
             collapsed_endpoints: &self.collapsed_endpoints,
@@ -65,7 +153,8 @@ impl ClientShellState {
             selected_workspace_id: self
                 .navigate_workspace_id
                 .as_ref()
-                .filter(|_| valid_navigation_target),
+                .filter(|_| valid_navigation_target)
+                .or_else(|| pending_workspace_highlight.map(|pending| &pending.target)),
             reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
             dragged_workspace_id: None,
             workspace_drop_indicator_row: None,
@@ -127,10 +216,23 @@ impl ClientShellState {
             &self.config.keybinds,
             &self.config.palette,
         );
+        if let Some(notice) = &self.visible_endpoint_notice {
+            self.hits.notification_toast = endpoint_notices::render_notice(
+                &mut buffer,
+                Rect::new(0, 0, cols, rows),
+                notice,
+                1,
+                &self.config.palette,
+            );
+        }
         FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[])
     }
 
-    pub(crate) fn compose(&mut self, cols: u16, rows: u16) -> Option<FrameData> {
+    pub(crate) fn compose(
+        &mut self,
+        cols: u16,
+        rows: u16,
+    ) -> Option<crate::client::frame_output::ComposedFrame> {
         self.last_composed_at = Some(std::time::Instant::now());
         self.selection_repaint_deadline = None;
         if self.last_composed_size != Some((cols, rows)) && self.mode == ClientShellMode::Navigate {
@@ -144,16 +246,38 @@ impl ClientShellState {
                 .as_ref()
                 .is_some_and(|target| self.navigation_target_valid(target));
         if self.snapshot.is_none() || self.pane_surface.is_none() {
-            return Some(self.compose_unavailable(cols, rows));
+            return Some(self.compose_unavailable(cols, rows).into());
         }
-        let snapshot = self.snapshot.as_deref()?;
-        // A one-step successor is retained separately until its exact snapshot arrives; do not
-        // keep composing the now-superseded current pair while it is pending.
-        if self.pending_pane_surface.is_some() {
+        if let Some(pending) = self.pending_pane_surface.take() {
+            let matches = self.snapshot.as_ref().is_some_and(|snapshot| {
+                pending.boot_id == snapshot.boot_id
+                    && pending.projection_revision == snapshot.revision
+            });
+            let newer = self.snapshot.as_ref().is_some_and(|snapshot| {
+                pending.boot_id == snapshot.boot_id
+                    && pending.projection_revision > snapshot.revision
+            });
+            if matches {
+                self.install_pane_surface(pending, false);
+            } else if newer {
+                // Keep the successor, but still present the current matching pair.
+                // Returning None here skipped compose_graphics after IMAGE_REQUESTED
+                // landed on the cell-only path.
+                self.pending_pane_surface = Some(pending);
+            }
+        }
+        let pending_workspace_highlight =
+            self.pending_workspace_highlight.as_ref().filter(|pending| {
+                self.mode != ClientShellMode::Navigate
+                    && pending.target.endpoint_id == self.active_endpoint_id
+                    && self.navigation_target_valid(&pending.target)
+            });
+        if self.pane_surface_generation != self.active_snapshot_generation {
             return None;
         }
+        let snapshot = self.snapshot.as_deref()?;
         let surface = self.pane_surface.as_ref()?;
-        if snapshot.revision != surface.projection_revision {
+        if snapshot.boot_id != surface.boot_id {
             return None;
         }
         let layout = self.layout(cols, rows);
@@ -182,6 +306,7 @@ impl ClientShellState {
             snapshot,
             &self.config,
             render::ShellRenderState {
+                machine_diagnostics: &self.machine_diagnostics,
                 endpoints: &self.endpoints,
                 active_endpoint_id: &self.active_endpoint_id,
                 collapsed_endpoints: &self.collapsed_endpoints,
@@ -198,84 +323,19 @@ impl ClientShellState {
                 selected_workspace_id: self
                     .navigate_workspace_id
                     .as_ref()
-                    .filter(|_| valid_navigation_target),
+                    .filter(|_| valid_navigation_target)
+                    .or_else(|| pending_workspace_highlight.map(|pending| &pending.target)),
                 reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
                 dragged_workspace_id,
                 workspace_drop_indicator_row,
             },
         );
-        self.hits.panes = surface
-            .panes
-            .iter()
-            .map(|pane| PaneHit {
-                rect: Rect::new(
-                    layout.pane_surface.x.saturating_add(pane.rect.x),
-                    layout.pane_surface.y.saturating_add(pane.rect.y),
-                    pane.rect.width,
-                    pane.rect.height,
-                ),
-                inner_rect: Rect::new(
-                    layout.pane_surface.x.saturating_add(pane.inner_rect.x),
-                    layout.pane_surface.y.saturating_add(pane.inner_rect.y),
-                    pane.inner_rect.width,
-                    pane.inner_rect.height,
-                ),
-                scrollbar_rect: pane.scrollbar_rect.map(|rect| {
-                    Rect::new(
-                        layout.pane_surface.x.saturating_add(rect.x),
-                        layout.pane_surface.y.saturating_add(rect.y),
-                        rect.width,
-                        rect.height,
-                    )
-                }),
-                scroll: pane.scroll.map(|metrics| crate::pane::ScrollMetrics {
-                    offset_from_bottom: usize::try_from(metrics.offset_from_bottom)
-                        .unwrap_or(usize::MAX),
-                    max_offset_from_bottom: usize::try_from(metrics.max_offset_from_bottom)
-                        .unwrap_or(usize::MAX),
-                    viewport_rows: usize::try_from(metrics.viewport_rows).unwrap_or(usize::MAX),
-                }),
-                pane_id: pane.pane_id.clone(),
-                popup: false,
-                mouse_reporting: pane.mouse_reporting,
-                sgr_pixel_mouse: pane.sgr_pixel_mouse,
-                pixel_width: pane.pixel_width,
-                pixel_height: pane.pixel_height,
-            })
-            .collect();
-        let topology_signature = pane_surface_topology_signature(surface);
-        self.hits.pane_splits = surface
-            .splits
-            .iter()
-            .map(|split| PaneSplitHit {
-                direction: split.direction,
-                pos: match split.direction {
-                    crate::protocol::PaneSurfaceSplitDirection::Horizontal => {
-                        layout.pane_surface.x.saturating_add(split.pos)
-                    }
-                    crate::protocol::PaneSurfaceSplitDirection::Vertical => {
-                        layout.pane_surface.y.saturating_add(split.pos)
-                    }
-                },
-                area: Rect::new(
-                    layout.pane_surface.x.saturating_add(split.area.x),
-                    layout.pane_surface.y.saturating_add(split.area.y),
-                    split.area.width,
-                    split.area.height,
-                ),
-                hit_rect: Rect::new(
-                    layout.pane_surface.x.saturating_add(split.hit_rect.x),
-                    layout.pane_surface.y.saturating_add(split.hit_rect.y),
-                    split.hit_rect.width,
-                    split.hit_rect.height,
-                ),
-                path: split.path.clone(),
-                topology_signature,
-            })
-            .collect();
-        if !self.config.mouse_capture {
-            self.hits.pane_splits.clear();
-        }
+        install_pane_surface_hits(
+            &mut self.hits,
+            self.config.mouse_capture,
+            layout.pane_surface,
+            surface,
+        );
         let mode_bar_area = if layout.mobile_header.is_empty()
             && self.config.tab_bar_position == TabBarPositionConfig::Bottom
             && !layout.tab_bar.is_empty()
@@ -394,12 +454,14 @@ impl ClientShellState {
                         .saturating_sub(copy_mode.offset_from_bottom)
                         .min(u32::MAX as usize) as u32;
                     let viewport_row = copy_mode.cursor.row.saturating_sub(viewport_top);
+                    let x = hit.inner_rect.x.saturating_add(copy_mode.cursor.col);
+                    let y = hit.inner_rect.y.saturating_add(viewport_row as u16);
                     if viewport_row < u32::from(hit.inner_rect.height)
                         && copy_mode.cursor.col < hit.inner_rect.width
+                        && x < frame.width
+                        && y < frame.height
                     {
                         let mut composed = frame.to_ratatui_buffer()?;
-                        let x = hit.inner_rect.x + copy_mode.cursor.col;
-                        let y = hit.inner_rect.y + viewport_row as u16;
                         occlusion.cover(Rect::new(x, y, 1, 1));
                         composed[(x, y)].set_style(
                             Style::default()
@@ -553,6 +615,7 @@ impl ClientShellState {
                     scrollbar_rect: None,
                     scroll: None,
                     pane_id: popup.terminal_id.clone(),
+                    content_revision: 0,
                     popup: true,
                     mouse_reporting: popup.mouse_reporting,
                     sgr_pixel_mouse: popup.sgr_pixel_mouse,
@@ -645,6 +708,8 @@ impl ClientShellState {
                 self.hits.navigator_popup = rendered.navigator_popup;
                 self.hits.navigator_search = rendered.navigator_search;
                 self.hits.navigator_rows = rendered.navigator_rows;
+                self.hits.navigator_scrollbar = rendered.navigator_scrollbar;
+                self.hits.navigator_scroll_metrics = rendered.navigator_scroll_metrics;
                 self.hits.worktree_search = rendered.worktree_search;
                 self.hits.worktree_rows = rendered.worktree_rows;
                 self.hits.help_popup = rendered.help_popup;
@@ -685,8 +750,163 @@ impl ClientShellState {
             self.hits.pane_splits.clear();
             self.hits.popup = None;
         }
-        self.compose_graphics(&mut frame, layout, &occlusion);
-        Some(frame)
+        let graphics = self.compose_graphics(layout, &occlusion);
+        Some(crate::client::frame_output::ComposedFrame { frame, graphics })
+    }
+
+    pub(crate) fn compose_chrome_patch(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        encoder_baseline: Option<&FrameData>,
+    ) -> Option<crate::client::shell::surface_patch::ClientComposedSurfacePatch> {
+        if self.mode != ClientShellMode::Terminal
+            || self.overlay.is_some()
+            || self.endpoint_error.is_some()
+            || self.config_diagnostic.is_some()
+            || self.visible_endpoint_notice.is_some()
+            || self.visible_notification.is_some()
+            || self.copy_feedback.is_some()
+            || self.selection.is_some()
+            || self.word_selection_gesture.is_some()
+            || self.copy_mode.is_some()
+            || self.selection_highlight_clear_deadline.is_some()
+        {
+            return None;
+        }
+        let baseline = encoder_baseline?;
+        if baseline.width != cols || baseline.height != rows {
+            return None;
+        }
+        let surface = self.pane_surface.as_ref()?;
+        let layout = self.layout(cols, rows);
+        if surface.frame.width != layout.pane_surface.width
+            || surface.frame.height != layout.pane_surface.height
+        {
+            return None;
+        }
+        if surface.popup.is_some()
+            || !surface.graphics.placements.is_empty()
+            || !surface.graphics.retained_assets.is_empty()
+        {
+            return None;
+        }
+        let snapshot = self.snapshot.as_deref()?;
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
+        self.hits = render::render_shell(
+            &mut buffer,
+            layout,
+            snapshot,
+            &self.config,
+            render::ShellRenderState {
+                machine_diagnostics: &self.machine_diagnostics,
+                endpoints: &self.endpoints,
+                active_endpoint_id: &self.active_endpoint_id,
+                collapsed_endpoints: &self.collapsed_endpoints,
+                collapsed_groups: &self.collapsed_groups,
+                remote_collapsed_groups: &self.remote_collapsed_groups,
+                workspace_scroll: &mut self.workspace_scroll,
+                agent_scroll: &mut self.agent_scroll,
+                tab_scroll: &mut self.tab_scroll,
+                reveal_focused_workspace: &mut self.reveal_focused_workspace,
+                reveal_focused_tab: &mut self.reveal_focused_tab,
+                sidebar_collapsed: self.sidebar_collapsed,
+                sidebar_section_split: self.sidebar_section_split,
+                tab_drag_insert_index: None,
+                selected_workspace_id: None,
+                reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
+                dragged_workspace_id: None,
+                workspace_drop_indicator_row: None,
+            },
+        );
+        install_pane_surface_hits(
+            &mut self.hits,
+            self.config.mouse_capture,
+            layout.pane_surface,
+            surface,
+        );
+
+        let pane_x = layout.pane_surface.x;
+        let pane_y = layout.pane_surface.y;
+        let pane_w = layout.pane_surface.width;
+        let pane_h = layout.pane_surface.height;
+
+        let mut patch_rows = Vec::new();
+        let blank_cell = || crate::protocol::CellData {
+            symbol: " ".to_owned(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink: None,
+        };
+        for y in 0..pane_y {
+            let mut cells = Vec::with_capacity(usize::from(cols));
+            for col in 0..cols {
+                let cell_data = buffer
+                    .cell((col, y))
+                    .map(crate::protocol::CellData::from_ratatui_cell)
+                    .unwrap_or_else(blank_cell);
+                cells.push(cell_data);
+            }
+            patch_rows.push(crate::protocol::PaneSurfacePatchRow { x: 0, y, cells });
+        }
+        for local_y in 0..pane_h {
+            let y = pane_y + local_y;
+            if pane_x > 0 {
+                let mut cells = Vec::with_capacity(usize::from(pane_x));
+                for col in 0..pane_x {
+                    let cell_data = buffer
+                        .cell((col, y))
+                        .map(crate::protocol::CellData::from_ratatui_cell)
+                        .unwrap_or_else(blank_cell);
+                    cells.push(cell_data);
+                }
+                patch_rows.push(crate::protocol::PaneSurfacePatchRow { x: 0, y, cells });
+            }
+            let right = pane_x.saturating_add(pane_w);
+            if right < cols {
+                let mut cells = Vec::with_capacity(usize::from(cols - right));
+                for col in right..cols {
+                    let cell_data = buffer
+                        .cell((col, y))
+                        .map(crate::protocol::CellData::from_ratatui_cell)
+                        .unwrap_or_else(blank_cell);
+                    cells.push(cell_data);
+                }
+                patch_rows.push(crate::protocol::PaneSurfacePatchRow { x: right, y, cells });
+            }
+        }
+        for y in (pane_y + pane_h)..rows {
+            let mut cells = Vec::with_capacity(usize::from(cols));
+            for col in 0..cols {
+                let cell_data = buffer
+                    .cell((col, y))
+                    .map(crate::protocol::CellData::from_ratatui_cell)
+                    .unwrap_or_else(blank_cell);
+                cells.push(cell_data);
+            }
+            patch_rows.push(crate::protocol::PaneSurfacePatchRow { x: 0, y, cells });
+        }
+
+        let cursor = surface
+            .frame
+            .cursor
+            .as_ref()
+            .map(|c| crate::protocol::CursorState {
+                x: pane_x.saturating_add(c.x),
+                y: pane_y.saturating_add(c.y),
+                visible: c.visible,
+                shape: c.shape,
+            });
+        Some(
+            crate::client::shell::surface_patch::ClientComposedSurfacePatch {
+                rows: patch_rows,
+                cursor,
+                appended_hyperlinks: Vec::new(),
+            },
+        )
     }
 }
 

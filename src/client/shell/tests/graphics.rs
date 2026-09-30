@@ -63,6 +63,48 @@ fn add_main_image(
     surface.graphics.placements.push(placement);
 }
 
+#[cfg(unix)]
+#[test]
+fn failed_direct_ack_composition_restores_graphics_for_inline_retry() {
+    use crate::kitty_graphics::surface::host_image_id;
+
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane = surface();
+    let (mut asset, mut placement) = image(
+        SurfaceGraphicsTarget::Pane {
+            pane_id: "pane_1".into(),
+        },
+        0,
+        0,
+        71,
+    );
+    asset.key.source = SurfaceGraphicsSource::PaneLayer {
+        pane_id: "pane_1".into(),
+        layer_id: "direct-rollback".into(),
+    };
+    placement.asset = asset.key.clone();
+    let key = asset.key.clone();
+    pane.graphics.assets.push(asset);
+    pane.graphics.placements.push(placement);
+    state.set_pane_surface(pane);
+
+    // Model an ACK arriving while projection pairing makes composition unavailable.
+    state.active_snapshot_generation = Some(state.active_snapshot_generation.unwrap_or(0) + 1);
+    let image_id = host_image_id(state.graphics_scope(), &key);
+    let graphics_before = format!("{:?}", state.graphics);
+    let checkpoint = state.direct_graphics_checkpoint();
+    assert!(state.trust_direct_graphics_asset(&key, image_id));
+    assert!(state.compose(106, 20).is_none());
+    state.restore_direct_graphics_checkpoint(checkpoint);
+    assert_eq!(format!("{:?}", state.graphics), graphics_before);
+
+    // Once pairing is available, fallback still owns the asset and uploads it normally.
+    state.active_snapshot_generation = state.pane_surface_generation;
+    let retry = state.compose(106, 20).expect("fallback frame");
+    assert!(String::from_utf8_lossy(&retry.graphics.into_inline_bytes()).contains("a=t"));
+}
+
 fn is_placed(bytes: &[u8], point: (u16, u16)) -> bool {
     String::from_utf8_lossy(bytes).contains(&format!("\x1b[{};{}H", point.1 + 1, point.0 + 1))
 }
@@ -85,11 +127,11 @@ fn assert_graphics_cover(state: &mut ClientShellState, covered: Rect, cols: u16,
     state.set_pane_surface(surface);
     let frame = state.compose(cols, rows).unwrap();
     assert!(
-        is_placed(&frame.graphics, outside),
+        is_placed(&frame.graphics.clone().into_inline_bytes(), outside),
         "outside={outside:?} cover={covered:?}"
     );
     assert!(
-        !is_placed(&frame.graphics, inside),
+        !is_placed(&frame.graphics.clone().into_inline_bytes(), inside),
         "inside={inside:?} cover={covered:?}"
     );
 }
@@ -210,35 +252,34 @@ fn every_dialog_and_menu_occludes_its_panel_not_the_whole_screen() {
         ClientShellOverlay::Rename(ClientRenameOverlay {
             title: "rename",
             input: "name".into(),
-            replace_on_type: false,
             target: ClientRenameTarget::Pane {
                 pane_id: "pane_1".into(),
             },
         }),
         ClientShellOverlay::ConfirmClose(ClientConfirmCloseOverlay {
             workspace_id: "ws_1".into(),
+            close_group: false,
+            tab_target: None,
             title: "close".into(),
             detail: "confirm".into(),
         }),
         ClientShellOverlay::Help(ClientHelpOverlay {
-            query: String::new(),
+            query: TextEditor::default(),
             search_focused: false,
             scroll: 0,
         }),
         ClientShellOverlay::Navigator(ClientNavigatorOverlay {
-            query: String::new(),
+            query: TextEditor::default(),
             search_focused: false,
             selected: None,
             scroll: 0,
             filter: None,
-            expanded_workspaces: HashSet::new(),
         }),
         ClientShellOverlay::WorktreeCreate(ClientWorktreeCreateOverlay {
             source_workspace_id: "ws_1".into(),
             repo_name: "repo".into(),
             branch: "branch".into(),
             checkout_path: "path".into(),
-            replace_on_type: false,
             error: None,
             creating: false,
         }),
@@ -246,7 +287,7 @@ fn every_dialog_and_menu_occludes_its_panel_not_the_whole_screen() {
             source_workspace_id: "ws_1".into(),
             entries: Vec::new(),
             selected: 0,
-            query: String::new(),
+            query: TextEditor::default(),
             search_focused: false,
             error: None,
             opening: false,
@@ -329,18 +370,38 @@ fn every_dialog_and_menu_occludes_its_panel_not_the_whole_screen() {
         state.compose(106, 40).unwrap();
         state.overlay = Some(overlay);
         let frame = state.compose(106, 40).unwrap();
-        assert!(is_placed(&frame.graphics, outside), "{:?}", state.overlay);
+        assert!(
+            is_placed(&frame.graphics.clone().into_inline_bytes(), outside),
+            "{:?}",
+            state.overlay
+        );
         if let Some(border) = border {
-            assert!(!is_placed(&frame.graphics, border), "{:?}", state.overlay);
-            assert!(String::from_utf8_lossy(&frame.graphics).contains("a=d,d=i"));
+            assert!(
+                !is_placed(&frame.graphics.clone().into_inline_bytes(), border),
+                "{:?}",
+                state.overlay
+            );
+            assert!(
+                String::from_utf8_lossy(&frame.graphics.clone().into_inline_bytes())
+                    .contains("a=d,d=i")
+            );
         }
         state.overlay = None;
         let restored = state.compose(106, 40).unwrap();
-        assert!(is_placed(&restored.graphics, outside));
+        assert!(is_placed(
+            &restored.graphics.clone().into_inline_bytes(),
+            outside
+        ));
         if let Some(border) = border {
-            assert!(is_placed(&restored.graphics, border));
+            assert!(is_placed(
+                &restored.graphics.clone().into_inline_bytes(),
+                border
+            ));
         }
-        assert!(!String::from_utf8_lossy(&restored.graphics).contains("a=t"));
+        assert!(
+            !String::from_utf8_lossy(&restored.graphics.clone().into_inline_bytes())
+                .contains("a=t")
+        );
     }
 }
 
@@ -379,17 +440,26 @@ fn selection_copy_cursor_and_search_hide_only_the_highlighted_images() {
         });
     let frame = state.compose(106, 20).unwrap();
     for point in &points[..3] {
-        assert!(!is_placed(&frame.graphics, *point), "{point:?}");
+        assert!(
+            !is_placed(&frame.graphics.clone().into_inline_bytes(), *point),
+            "{point:?}"
+        );
     }
-    assert!(is_placed(&frame.graphics, points[3]));
+    assert!(is_placed(
+        &frame.graphics.clone().into_inline_bytes(),
+        points[3]
+    ));
     state.mode = ClientShellMode::Terminal;
     state.copy_mode = None;
     state.selection = None;
     let frame = state.compose(106, 20).unwrap();
     for point in points {
-        assert!(is_placed(&frame.graphics, point));
+        assert!(is_placed(
+            &frame.graphics.clone().into_inline_bytes(),
+            point
+        ));
     }
-    assert!(!String::from_utf8_lossy(&frame.graphics).contains("a=t"));
+    assert!(!String::from_utf8_lossy(&frame.graphics.clone().into_inline_bytes()).contains("a=t"));
 }
 
 #[test]
@@ -402,15 +472,26 @@ fn mobile_switcher_still_hides_the_entire_underlying_surface() {
     add_main_image(&mut surface, layout, point, 1);
     state.set_pane_surface(surface);
     let frame = state.compose(40, 24).unwrap();
-    assert!(is_placed(&frame.graphics, point));
+    assert!(is_placed(
+        &frame.graphics.clone().into_inline_bytes(),
+        point
+    ));
     state.mode = ClientShellMode::Navigate;
     let frame = state.compose(40, 24).unwrap();
-    assert!(!is_placed(&frame.graphics, point));
-    assert!(String::from_utf8_lossy(&frame.graphics).contains("a=d,d=i"));
+    assert!(!is_placed(
+        &frame.graphics.clone().into_inline_bytes(),
+        point
+    ));
+    assert!(
+        String::from_utf8_lossy(&frame.graphics.clone().into_inline_bytes()).contains("a=d,d=i")
+    );
     state.mode = ClientShellMode::Terminal;
     let frame = state.compose(40, 24).unwrap();
-    assert!(is_placed(&frame.graphics, point));
-    assert!(!String::from_utf8_lossy(&frame.graphics).contains("a=t"));
+    assert!(is_placed(
+        &frame.graphics.clone().into_inline_bytes(),
+        point
+    ));
+    assert!(!String::from_utf8_lossy(&frame.graphics.clone().into_inline_bytes()).contains("a=t"));
 }
 
 #[test]
@@ -439,15 +520,33 @@ fn popup_terminal_keeps_own_graphics_and_hides_only_background_overlap() {
     surface.graphics.placements.push(placement);
     state.set_pane_surface(surface);
     let frame = state.compose(106, 20).unwrap();
-    assert!(is_placed(&frame.graphics, outside));
-    assert!(!is_placed(&frame.graphics, border));
-    assert!(is_placed(&frame.graphics, inside));
+    assert!(is_placed(
+        &frame.graphics.clone().into_inline_bytes(),
+        outside
+    ));
+    assert!(!is_placed(
+        &frame.graphics.clone().into_inline_bytes(),
+        border
+    ));
+    assert!(is_placed(
+        &frame.graphics.clone().into_inline_bytes(),
+        inside
+    ));
     state.overlay = Some(ClientShellOverlay::Onboarding);
     let frame = state.compose(106, 20).unwrap();
-    assert!(is_placed(&frame.graphics, outside));
-    assert!(!is_placed(&frame.graphics, inside));
+    assert!(is_placed(
+        &frame.graphics.clone().into_inline_bytes(),
+        outside
+    ));
+    assert!(!is_placed(
+        &frame.graphics.clone().into_inline_bytes(),
+        inside
+    ));
     state.overlay = None;
     let frame = state.compose(106, 20).unwrap();
-    assert!(is_placed(&frame.graphics, inside));
-    assert!(!String::from_utf8_lossy(&frame.graphics).contains("a=t"));
+    assert!(is_placed(
+        &frame.graphics.clone().into_inline_bytes(),
+        inside
+    ));
+    assert!(!String::from_utf8_lossy(&frame.graphics.clone().into_inline_bytes()).contains("a=t"));
 }

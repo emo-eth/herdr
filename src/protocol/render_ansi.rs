@@ -137,22 +137,55 @@ impl BlitEncoder {
         self.last_frame.as_ref() == Some(frame)
     }
 
+    pub(crate) fn last_frame(&self) -> Option<&FrameData> {
+        self.last_frame.as_ref()
+    }
+    #[cfg(test)]
     pub(crate) fn encode_patch(
         &self,
         rows: &[PaneSurfacePatchRow],
         cursor: Option<CursorState>,
         suppress_visible_cursor: bool,
     ) -> Option<EncodedBlit> {
+        self.encode_patch_with_hyperlinks(rows, cursor, None, suppress_visible_cursor)
+    }
+
+    pub(crate) fn encode_patch_with_hyperlinks(
+        &self,
+        rows: &[PaneSurfacePatchRow],
+        cursor: Option<CursorState>,
+        appended_hyperlinks: Option<&[String]>,
+        suppress_visible_cursor: bool,
+    ) -> Option<EncodedBlit> {
         let frame = self.last_frame.as_ref()?;
-        if rows.iter().any(|row| !patch_row_fits(frame, row)) || patch_rows_overlap(rows) {
+        let appended_count = appended_hyperlinks.map_or(0, |h| h.len());
+        if rows
+            .iter()
+            .any(|row| !patch_row_fits_with_appended(frame, row, appended_count))
+            || patch_rows_overlap(rows)
+        {
             return None;
+        }
+        // Metadata revisions need no terminal output. Keep visible cursors on
+        // the normal path because their suppression policy can change.
+        if rows.is_empty()
+            && cursor == frame.cursor
+            && cursor.as_ref().is_none_or(|cursor| !cursor.visible)
+        {
+            return Some(EncodedBlit {
+                bytes: Vec::new(),
+                full: false,
+                next_last_visible_cursor: self.last_visible_cursor,
+                next_last_cursor_shape: self.last_cursor_shape,
+            });
         }
         let mut bytes = Vec::new();
         let mut next_last_visible_cursor = self.last_visible_cursor;
         let mut next_last_cursor_shape = self.last_cursor_shape;
-        blit_patch_to(
+        blit_patch_to_with_appended(
             &mut bytes,
             frame,
+            appended_hyperlinks,
             rows,
             cursor,
             &mut next_last_visible_cursor,
@@ -232,6 +265,24 @@ impl BlitEncoder {
         self.last_visible_cursor = encoded.next_last_visible_cursor;
         self.last_cursor_shape = encoded.next_last_cursor_shape;
         true
+    }
+
+    pub(crate) fn commit_patch_with_hyperlinks(
+        &mut self,
+        rows: &[PaneSurfacePatchRow],
+        cursor: Option<CursorState>,
+        appended_hyperlinks: Option<&[String]>,
+        encoded: EncodedBlit,
+    ) -> bool {
+        let Some(frame) = self.last_frame.as_mut() else {
+            return false;
+        };
+        if let Some(appended) = appended_hyperlinks {
+            if !appended.is_empty() {
+                frame.hyperlinks.extend(appended.iter().cloned());
+            }
+        }
+        self.commit_patch(rows, cursor, encoded)
     }
 }
 
@@ -553,39 +604,46 @@ fn patch_cell_mut(rows: &mut [PaneSurfacePatchRow], x: u16, y: u16) -> Option<&m
 }
 
 fn patch_rows_overlap(rows: &[PaneSurfacePatchRow]) -> bool {
-    rows.iter().enumerate().any(|(index, left)| {
-        let left_end = left.x.saturating_add(left.cells.len() as u16);
-        rows[index + 1..].iter().any(|right| {
-            if left.y != right.y {
-                return false;
-            }
-            let right_end = right.x.saturating_add(right.cells.len() as u16);
-            left.x < right_end && right.x < left_end
-        })
-    })
+    if rows.len() < 2 {
+        return false;
+    }
+    let mut spans = rows
+        .iter()
+        .map(|row| (row.y, row.x, row.x.saturating_add(row.cells.len() as u16)))
+        .collect::<Vec<_>>();
+    spans.sort_unstable();
+    spans
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0 && pair[1].1 < pair[0].2)
 }
 
-fn patch_row_fits(frame: &FrameData, row: &PaneSurfacePatchRow) -> bool {
+fn patch_row_fits_with_appended(
+    frame: &FrameData,
+    row: &PaneSurfacePatchRow,
+    appended_count: usize,
+) -> bool {
     let Ok(len) = u16::try_from(row.cells.len()) else {
         return false;
     };
-    if row.y >= frame.height
-        || row.x.saturating_add(len) > frame.width
-        || row.cells.iter().any(|cell| cell.hyperlink.is_some())
-    {
+    if row.y >= frame.height || row.x.saturating_add(len) > frame.width {
+        return false;
+    }
+    let max_hyperlink = frame.hyperlinks.len().saturating_add(appended_count);
+    if row.cells.iter().any(|cell| {
+        cell.hyperlink
+            .is_some_and(|idx| idx as usize >= max_hyperlink)
+    }) {
         return false;
     }
     let start = usize::from(row.y) * usize::from(frame.width) + usize::from(row.x);
     let end = start + row.cells.len();
-    frame
-        .cells
-        .get(start..end)
-        .is_some_and(|cells| cells.iter().all(|cell| cell.hyperlink.is_none()))
+    frame.cells.get(start..end).is_some()
 }
 
-fn blit_patch_to(
+fn blit_patch_to_with_appended(
     mut writer: impl Write,
     frame: &FrameData,
+    appended_hyperlinks: Option<&[String]>,
     rows: &[PaneSurfacePatchRow],
     cursor: Option<CursorState>,
     last_visible_cursor: &mut Option<(u16, u16)>,
@@ -595,6 +653,7 @@ fn blit_patch_to(
 ) {
     let _ = writer.write_all(b"\x1b[?2026h\x1b[?25l\x1b]8;;\x1b\\");
     let mut last_sgr = String::new();
+    let mut last_style = None;
     let mut active_hyperlink = None;
     for row in rows {
         let mut invalidated = 0usize;
@@ -607,13 +666,15 @@ fn blit_patch_to(
             if !cell.skip && (!cells_equal(cell, prev_cell) || invalidated > 0) && to_skip == 0 {
                 let cursor_position =
                     (next_inline_col != Some(col) || invalidated > 0).then_some((col, row.y));
-                write_cell(
+                write_cell_with_appended(
                     &mut writer,
                     cursor_position,
                     cell,
                     &mut last_sgr,
+                    &mut last_style,
                     &mut active_hyperlink,
                     frame,
+                    appended_hyperlinks,
                 );
                 next_inline_col = (cell.symbol.is_ascii() && cell_width(cell) == 1)
                     .then_some(col.saturating_add(1));
@@ -627,7 +688,6 @@ fn blit_patch_to(
     if !last_sgr.is_empty() {
         let _ = writer.write_all(b"\x1b[0m");
     }
-
     let cursor_frame = FrameData {
         cells: Vec::new(),
         width: frame.width,
@@ -838,6 +898,7 @@ fn write_ime_anchor_cursor_state(writer: &mut impl Write, cursor: HostCursorStat
 
 fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
     let mut last_sgr = String::new();
+    let mut last_style = None;
     let mut active_hyperlink = None;
     for row in 0..frame.height {
         let mut to_skip = 0usize;
@@ -862,6 +923,7 @@ fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
                 cursor_position,
                 cell,
                 &mut last_sgr,
+                &mut last_style,
                 &mut active_hyperlink,
                 frame,
             );
@@ -878,9 +940,21 @@ fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
     let _ = writer.write_all(b"\x1b[0m");
 }
 
-fn cell_hyperlink_uri<'a>(frame: &'a FrameData, cell: &CellData) -> Option<&'a str> {
+fn cell_hyperlink_uri_with_appended<'a>(
+    frame: &'a FrameData,
+    appended: Option<&'a [String]>,
+    cell: &CellData,
+) -> Option<&'a str> {
     let index = cell.hyperlink? as usize;
-    frame.hyperlinks.get(index).map(String::as_str)
+    if index < frame.hyperlinks.len() {
+        frame.hyperlinks.get(index).map(String::as_str)
+    } else if let Some(appended) = appended {
+        appended
+            .get(index - frame.hyperlinks.len())
+            .map(String::as_str)
+    } else {
+        None
+    }
 }
 
 fn sanitized_hyperlink_uri(uri: &str) -> Option<String> {
@@ -931,14 +1005,36 @@ fn close_hyperlink(writer: &mut impl Write, active: &mut Option<String>) {
         let _ = writer.write_all(b"\x1b]8;;\x1b\\");
     }
 }
-
 fn write_cell(
     writer: &mut impl Write,
     cursor_position: Option<(u16, u16)>,
     cell: &CellData,
     last_sgr: &mut String,
+    last_style: &mut Option<(u32, u32, u16)>,
     active_hyperlink: &mut Option<String>,
     frame: &FrameData,
+) {
+    write_cell_with_appended(
+        writer,
+        cursor_position,
+        cell,
+        last_sgr,
+        last_style,
+        active_hyperlink,
+        frame,
+        None,
+    );
+}
+
+fn write_cell_with_appended(
+    writer: &mut impl Write,
+    cursor_position: Option<(u16, u16)>,
+    cell: &CellData,
+    last_sgr: &mut String,
+    last_style: &mut Option<(u32, u32, u16)>,
+    active_hyperlink: &mut Option<String>,
+    frame: &FrameData,
+    appended_hyperlinks: Option<&[String]>,
 ) {
     if cell.skip {
         return;
@@ -948,13 +1044,21 @@ fn write_cell(
         write_cursor_position(writer, position);
     }
 
-    let sgr = build_sgr(cell.fg, cell.bg, cell.modifier);
-    if sgr != *last_sgr {
-        let _ = writer.write_all(sgr.as_bytes());
-        *last_sgr = sgr;
+    let style = (cell.fg, cell.bg, cell.modifier);
+    if *last_style != Some(style) {
+        let sgr = build_sgr(cell.fg, cell.bg, cell.modifier);
+        if sgr != *last_sgr {
+            let _ = writer.write_all(sgr.as_bytes());
+            *last_sgr = sgr;
+        }
+        *last_style = Some(style);
     }
 
-    write_hyperlink_if_changed(writer, active_hyperlink, cell_hyperlink_uri(frame, cell));
+    write_hyperlink_if_changed(
+        writer,
+        active_hyperlink,
+        cell_hyperlink_uri_with_appended(frame, appended_hyperlinks, cell),
+    );
     let _ = writer.write_all(cell.symbol.as_bytes());
 }
 
@@ -976,6 +1080,7 @@ fn cells_visually_equal(
 
 fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameData) {
     let mut last_sgr = String::new(); // Track last SGR to avoid redundant style changes.
+    let mut last_style = None;
     let mut active_hyperlink = None;
     let sanitized_hyperlinks = sanitized_frame_hyperlinks(frame);
     let prev_sanitized_hyperlinks = sanitized_frame_hyperlinks(prev);
@@ -1008,6 +1113,7 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
                     cursor_position,
                     cell,
                     &mut last_sgr,
+                    &mut last_style,
                     &mut active_hyperlink,
                     frame,
                 );
@@ -1137,6 +1243,26 @@ mod tests {
     #[test]
     fn build_sgr_resets_previous_modifiers_when_cell_is_plain() {
         assert_eq!(build_sgr(0x00_00_00_00, 0x00_00_00_00, 0), "\x1b[0;39;49m");
+    }
+
+    #[test]
+    fn repeated_and_equivalent_styles_keep_text_and_link_changes() {
+        let mut cells = vec![
+            make_cell("a", 0, 0, 0),
+            make_cell("b", 0, 0, 0),
+            make_cell("c", 0xff_00_00_00, 0, 0), // Unknown color also encodes as reset.
+            make_cell("d", 2, 0, 0),
+            make_cell("e", 0, 0, 0),
+        ];
+        cells[1].hyperlink = Some(0);
+        let mut frame = make_frame(5, 1, cells);
+        frame.hyperlinks.push("https://example.com".into());
+        let mut output = Vec::new();
+        write_all_cells(&mut output, &frame);
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\x1b[1;1H\x1b[0;39;49ma\x1b]8;;https://example.com\x1b\\b\x1b]8;;\x1b\\c\x1b[0;31;49md\x1b[0;39;49me\x1b[0m"
+        );
     }
 
     #[test]
@@ -1855,6 +1981,72 @@ mod tests {
         ];
 
         assert!(encoder.encode_patch(&rows, None, false).is_none());
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        assert!(encoder.encode_patch(&reversed, None, false).is_none());
+
+        // Input order need not match screen order; touching runs are disjoint.
+        let disjoint = vec![
+            PaneSurfacePatchRow {
+                x: 2,
+                y: 0,
+                cells: vec![make_cell("Z", 0, 0, 0)],
+            },
+            rows[0].clone(),
+        ];
+        assert!(encoder.encode_patch(&disjoint, None, false).is_some());
+    }
+
+    #[test]
+    fn metadata_only_patches_do_not_write_but_cursor_changes_do() {
+        let mut frame = make_frame(3, 1, vec![make_cell("a", 0, 0, 0); 3]);
+        let mut encoder = BlitEncoder::new();
+        for cursor in [
+            None,
+            Some(CursorState {
+                x: 0,
+                y: 0,
+                visible: false,
+                shape: 2,
+            }),
+        ] {
+            frame.cursor = cursor.clone();
+            let initial = encoder.encode(&frame, false);
+            encoder.commit(frame.clone(), initial);
+            let encoded = encoder.encode_patch(&[], cursor.clone(), false).unwrap();
+            assert!(encoded.bytes.is_empty());
+            assert!(encoder.commit_patch(&[], cursor, encoded));
+            assert!(encoder.is_current(&frame));
+        }
+        for cursor in [
+            CursorState {
+                x: 2,
+                y: 0,
+                visible: false,
+                shape: 2,
+            },
+            CursorState {
+                x: 2,
+                y: 0,
+                visible: true,
+                shape: 2,
+            },
+        ] {
+            let encoded = encoder
+                .encode_patch(&[], Some(cursor.clone()), false)
+                .unwrap();
+            assert!(String::from_utf8_lossy(&encoded.bytes).contains("\x1b[1;3H"));
+            assert!(encoder.commit_patch(&[], Some(cursor), encoded));
+        }
+        // Switching to a client-drawn cursor must still hide the visible host cursor.
+        let encoded = encoder
+            .encode_patch(
+                &[],
+                encoder.last_frame.as_ref().unwrap().cursor.clone(),
+                true,
+            )
+            .unwrap();
+        assert!(String::from_utf8_lossy(&encoded.bytes).contains("\x1b[?25l"));
     }
 
     #[test]
@@ -2351,5 +2543,41 @@ mod tests {
             output_str.contains("\x1b[1;2H"),
             "cells hidden by a previous halfwidth voiced kana must be redrawn when visible"
         );
+    }
+
+    #[test]
+    fn retained_patch_encodes_hyperlinks_and_preserves_osc8_closure() {
+        let mut frame = make_frame(
+            3,
+            1,
+            vec![
+                make_cell("a", 0, 0, 0),
+                make_cell("b", 0, 0, 0),
+                make_cell("c", 0, 0, 0),
+            ],
+        );
+        frame.hyperlinks.push("https://example.com/item".into());
+
+        let mut encoder = BlitEncoder::new();
+        let initial = encoder.encode(&frame, false);
+        encoder.commit(frame.clone(), initial);
+
+        let mut linked = make_cell("L", 0, 0, 0);
+        linked.hyperlink = Some(0);
+        let rows = vec![PaneSurfacePatchRow {
+            x: 1,
+            y: 0,
+            cells: vec![linked],
+        }];
+
+        let patch = encoder
+            .encode_patch(&rows, None, false)
+            .expect("valid patch with hyperlink");
+        let output = String::from_utf8(patch.bytes.clone()).unwrap();
+        assert!(output.contains("\x1b]8;;https://example.com/item\x1b\\"));
+        assert!(output.contains("\x1b]8;;\x1b\\")); // OSC 8 closed
+        assert!(encoder.commit_patch(&rows, None, patch));
+        assert_eq!(encoder.last_frame().unwrap().cells[1].symbol, "L");
+        assert_eq!(encoder.last_frame().unwrap().cells[1].hyperlink, Some(0));
     }
 }
