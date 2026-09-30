@@ -280,20 +280,19 @@ pub(crate) fn message(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> Opti
     }
     let mut scrolls = Vec::new();
     let mut residual = Vec::new();
-    let candidate_panes = if patch.panes.is_empty() {
-        &last.panes[..]
-    } else {
-        &patch.panes[..]
-    };
-    for pane in candidate_panes {
-        let rect = pane.inner_rect;
-        // Both peers hold the committed geometry; never scroll a region that moved.
-        let committed = last
+    for pane in &last.panes {
+        let effective_rect = patch
             .panes
             .iter()
-            .any(|existing| existing.pane_id == pane.pane_id && existing.inner_rect == rect);
+            .find(|p| p.pane_id == pane.pane_id)
+            .map_or(pane.inner_rect, |p| p.inner_rect);
+        // Both peers hold the committed geometry; never scroll a region that moved.
+        if effective_rect != pane.inner_rect {
+            continue;
+        }
+        let rect = effective_rect;
         let scroll = SurfaceScroll { rect, shift: 1 };
-        if !committed || !scroll_fits(&scroll, frame.width, frame.height) {
+        if !scroll_fits(&scroll, frame.width, frame.height) {
             continue;
         }
         if let Some((shift, rows)) = pane_scroll(frame, rect, &patch.rows) {
@@ -721,5 +720,71 @@ mod tests {
         assert!(decode("").is_err());
         assert!(decode(&STANDARD_NO_PAD.encode([0u8])).is_err());
         assert!(decode(&STANDARD_NO_PAD.encode([1u8, 0, 0])).is_err());
+    }
+
+    #[test]
+    fn mixed_update_preserves_scroll_when_sibling_pane_has_metadata_changes() {
+        let mut last = surface();
+        let pane_b = PaneSurfacePane {
+            pane_id: "w1:p2".into(),
+            content_revision: 1,
+            rect: SurfaceRect {
+                x: 23,
+                y: 0,
+                width: 7,
+                height: 12,
+            },
+            inner_rect: SurfaceRect {
+                x: 23,
+                y: 1,
+                width: 5,
+                height: 10,
+            },
+            scrollbar_rect: None,
+            scroll: None,
+            focused: false,
+            mouse_reporting: false,
+            sgr_pixel_mouse: false,
+            alternate_screen_active: false,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        last.panes.push(pane_b);
+
+        let mut next = last.frame.clone();
+        for y in 0..PANE.height {
+            write(&mut next, y, &line(i32::from(y) + 1));
+        }
+
+        let mut patch = row_patch(&last, &next);
+        let mut updated_b = last.panes[1].clone();
+        updated_b.mouse_reporting = true;
+        patch.panes = vec![updated_b];
+
+        let (size, result) = round_trip(&last, &patch);
+        assert_eq!(result.cells, next.cells);
+        let plain = encoded_size(&patch).unwrap();
+        assert!(
+            size * 2 < plain,
+            "mixed update scroll must be compressed: {size} vs {plain}"
+        );
+    }
+
+    #[test]
+    fn moved_geometry_is_not_scrolled() {
+        let last = surface();
+        let mut next = last.frame.clone();
+        for y in 0..PANE.height {
+            write(&mut next, y, &line(i32::from(y) + 1));
+        }
+        let mut patch = row_patch(&last, &next);
+        let mut moved_pane = last.panes[0].clone();
+        moved_pane.inner_rect.x += 1;
+        patch.panes = vec![moved_pane];
+
+        assert!(
+            message(&last, &patch).is_none(),
+            "moved pane must not be scrolled"
+        );
     }
 }
