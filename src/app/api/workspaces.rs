@@ -1071,6 +1071,9 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_create_no_focus_preserves_none_active_and_mode() {
+        use super::super::test_support::{exiting_test_command, shutdown_test_runtimes};
+        use crate::config::ShellModeConfig;
+
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),
@@ -1079,6 +1082,8 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         );
+        app.state.default_shell = exiting_test_command().into();
+        app.state.shell_mode = ShellModeConfig::NonLogin;
         app.state.workspaces = vec![Workspace::test_new("existing")];
         app.state.active = None;
         app.state.selected = 0;
@@ -1123,5 +1128,6 @@ mod tests {
         assert_eq!(app.state.active, Some(2));
         assert_eq!(app.state.selected, 2);
         assert_eq!(app.state.mode, crate::app::Mode::Terminal);
+        shutdown_test_runtimes(&mut app);
     }
 }

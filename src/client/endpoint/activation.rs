@@ -573,68 +573,6 @@ impl PendingEndpointActivation {
         self.progress()
     }
 
-    pub(crate) fn receive_surface_delta(
-        &mut self,
-        endpoint_id: &ClientEndpointId,
-        generation: u64,
-        delta: crate::protocol::delta::ClientShellSurfaceDelta,
-        shell: Option<&mut crate::client::shell::ClientShellState>,
-    ) -> SurfaceActivationProgress {
-        let lease = match &self.phase {
-            ActivationPhase::ActivatingTarget { .. } => &self.target,
-            ActivationPhase::RestoringSource { .. } => &self.source,
-            ActivationPhase::SynchronizingPresentation { lease, .. }
-            | ActivationPhase::AwaitingPresentationEffects { lease, .. } => lease,
-            _ => return SurfaceActivationProgress::Stale,
-        };
-        if !endpoint_matches(lease, endpoint_id, generation, &delta.boot_id) {
-            return SurfaceActivationProgress::Stale;
-        }
-        match &mut self.phase {
-            ActivationPhase::ActivatingTarget { evidence, .. }
-            | ActivationPhase::RestoringSource { evidence, .. } => {
-                if let Some(surface) = evidence.surface.as_mut() {
-                    let mut graphics = std::mem::take(&mut surface.graphics);
-                    let result = delta.apply_to(surface, &mut graphics);
-                    surface.graphics = graphics;
-                    if result.is_err() {
-                        tracing::debug!(
-                            "activation surface delta did not apply; requesting a seed"
-                        );
-                        evidence.seed_resync_pending = true;
-                        return SurfaceActivationProgress::Pending;
-                    }
-                } else {
-                    tracing::debug!("activation surface delta ignored without a seed surface");
-                }
-            }
-            ActivationPhase::SynchronizingPresentation { evidence, .. } => {
-                let mut failed = false;
-                if let Some(surface) = evidence.surface.as_mut() {
-                    let mut graphics = std::mem::take(&mut surface.graphics);
-                    failed = delta.apply_to(surface, &mut graphics).is_err();
-                    surface.graphics = graphics;
-                }
-                if let Some(shell) = shell {
-                    failed |= matches!(
-                        shell.apply_surface_delta(delta),
-                        crate::client::shell::ClientPaneSurfacePatchOutcome::Rejected
-                    );
-                }
-                if failed {
-                    evidence.seed_resync_pending = true;
-                }
-            }
-            ActivationPhase::AwaitingPresentationEffects { .. } => {
-                if let Some(shell) = shell {
-                    let _ = shell.apply_surface_delta(delta);
-                }
-            }
-            _ => {}
-        }
-        self.progress()
-    }
-
     pub(crate) fn receive_surface_patch(
         &mut self,
         endpoint_id: &ClientEndpointId,

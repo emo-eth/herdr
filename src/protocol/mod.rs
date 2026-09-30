@@ -8,6 +8,4 @@ pub(crate) mod surface_reuse;
 pub(crate) mod surface_scroll;
 mod wire;
 
-pub use delta::*;
-
 pub use wire::*;

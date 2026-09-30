@@ -73,7 +73,6 @@ async fn surface_scroll_sends_scrolling_output_as_a_shift_and_new_rows() {
     );
     shutdown_test_runtimes(&mut server);
 }
-
 #[tokio::test]
 async fn surface_scroll_is_not_sent_to_a_peer_that_did_not_negotiate_it() {
     let (mut server, _control_rx, render_rx, pane_id) =
@@ -85,5 +84,48 @@ async fn surface_scroll_is_not_sent_to_a_peer_that_did_not_negotiate_it() {
     assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
     let message = read_server_message(render_rx.recv_timeout(Duration::from_secs(1)).unwrap());
     assert!(matches!(message, ServerMessage::PaneSurfacePatch(_)));
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn mixed_scrolling_and_status_output_delivers_canonical_patches() {
+    let (mut server, _control_rx, render_rx, pane_id) =
+        retained_test_server_with_control(&scrolling_lines(0..40));
+    server
+        .clients
+        .get_mut(&1)
+        .expect("scroll client")
+        .render_state
+        .enable_surface_scroll(true);
+    server.render_and_stream();
+    let mut decoder = protocol::surface_reuse::Decoder::new(false, true);
+    let ServerMessage::PaneSurface(mut shell) = decoder
+        .decode(read_server_message(
+            render_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ))
+        .expect("initial surface")
+    else {
+        panic!("expected the initial pane surface");
+    };
+
+    // Write a mixed update: scrolling lines followed by an in-place status line
+    let mut mixed = scrolling_lines(40..42);
+    mixed.extend_from_slice(b"\x1b[1;1H\x1b[32m[SPINNER: WORKING]\x1b[0m");
+    write_shared_test_pane(&mut server, pane_id, &mixed);
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    let bytes = render_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let message = read_server_message(bytes);
+    // Mixed updates with non-scrolling mutations fall back to canonical PaneSurfacePatch
+    let ServerMessage::PaneSurfacePatch(patch) = decoder.decode(message).expect("patch decode")
+    else {
+        panic!("expected a pane surface patch");
+    };
+    apply_rows(&mut shell.frame, &patch.rows);
+    let committed = server.clients[&1]
+        .render_state
+        .last_pane_surface()
+        .expect("committed surface");
+    assert_eq!(shell.frame.cells, committed.frame.cells);
+    assert!(frame_text(&shell.frame).contains("[SPINNER: WORKING]"));
     shutdown_test_runtimes(&mut server);
 }

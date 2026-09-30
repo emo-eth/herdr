@@ -12,7 +12,6 @@ pub(crate) enum EndpointControlMessage {
     AgentCompletions(crate::protocol::endpoint::EndpointAgentCompletions),
     Snapshot(Box<crate::protocol::ClientShellSnapshot>),
     SnapshotDelta(Box<crate::protocol::delta::ClientShellSnapshotDelta>),
-    SurfaceDelta(Box<crate::protocol::delta::ClientShellSurfaceDelta>),
     Ignored,
 }
 
@@ -64,11 +63,6 @@ pub(crate) fn decode_endpoint_control(
         let delta = crate::protocol::delta::decode_snapshot_delta(data)
             .map_err(|error| format!("invalid endpoint snapshot delta: {error}"))?;
         return Ok(EndpointControlMessage::SnapshotDelta(Box::new(delta)));
-    }
-    if kind == crate::protocol::endpoint::SURFACE_CODEC_DELTA_V2 {
-        let delta = crate::protocol::delta::decode_surface_delta(data)
-            .map_err(|error| format!("invalid endpoint surface delta: {error}"))?;
-        return Ok(EndpointControlMessage::SurfaceDelta(Box::new(delta)));
     }
     if kind.starts_with("shell.snapshot.") {
         return Err(format!(

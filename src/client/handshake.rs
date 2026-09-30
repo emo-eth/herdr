@@ -12,7 +12,7 @@ use crate::ipc::LocalStream;
 use crate::protocol::endpoint::{
     EndpointClientHello, EndpointServerWelcome, BLOB_CODEC_V1, ENDPOINT_HELLO_KIND,
     ENDPOINT_PROTOCOL_GENERATION, ENDPOINT_WELCOME_KIND, INPUT_CODEC_V1, SNAPSHOT_CODEC_DELTA_V2,
-    SNAPSHOT_CODEC_V1, SURFACE_CODEC_DELTA_V2, SURFACE_CODEC_V1,
+    SNAPSHOT_CODEC_V1, SURFACE_CODEC_V1,
 };
 use crate::protocol::{
     self, ClientMessage, RenderEncoding, ServerMessage, MAX_FRAME_SIZE, PROTOCOL_VERSION,
@@ -202,7 +202,7 @@ pub(super) fn do_handshake(
             surface_delta: true,
             surface_scroll: true,
             snapshot_codecs: vec![SNAPSHOT_CODEC_DELTA_V2.into(), SNAPSHOT_CODEC_V1.into()],
-            surface_codecs: vec![SURFACE_CODEC_DELTA_V2.into(), SURFACE_CODEC_V1.into()],
+            surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
             blob_codecs: vec![BLOB_CODEC_V1.into()],
         };
@@ -270,8 +270,7 @@ pub(super) fn do_handshake(
         }
         let valid_snapshot = welcome.snapshot_codec == SNAPSHOT_CODEC_V1
             || welcome.snapshot_codec == SNAPSHOT_CODEC_DELTA_V2;
-        let valid_surface = welcome.surface_codec == SURFACE_CODEC_V1
-            || welcome.surface_codec == SURFACE_CODEC_DELTA_V2;
+        let valid_surface = welcome.surface_codec == SURFACE_CODEC_V1;
         if welcome.generation != ENDPOINT_PROTOCOL_GENERATION
             || !valid_snapshot
             || !valid_surface

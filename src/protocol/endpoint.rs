@@ -19,7 +19,6 @@ pub const SNAPSHOT_CODEC_V1: &str = "shell.snapshot.v1";
 pub const SNAPSHOT_CODEC_DELTA_V2: &str = super::delta::SNAPSHOT_CODEC_DELTA_V2;
 pub const ENDPOINT_SNAPSHOT_KIND: &str = SNAPSHOT_CODEC_V1;
 pub const SURFACE_CODEC_V1: &str = "shell.surface.v1";
-pub const SURFACE_CODEC_DELTA_V2: &str = super::delta::SURFACE_CODEC_DELTA_V2;
 pub const INPUT_CODEC_V1: &str = "shell.input.semantic.v1";
 pub const BLOB_CODEC_V1: &str = "shell.blob.v1";
 pub const SURFACE_INTEREST_CAPABILITY: &str = "surface_interest";

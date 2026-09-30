@@ -1509,41 +1509,25 @@ fn mouse_drag_selection_survives_rapid_deltas_and_blocks_direct_blit() {
     assert!(sel.is_in_progress());
     assert_eq!(sel.ordered_cells(), ((0, 2), (0, 6)));
 
-    // Deliver rapid deltas while drag is in progress
+    // Deliver rapid patches while drag is in progress
     for rev in 1..=5 {
-        let delta = crate::protocol::delta::ClientShellSurfaceDelta {
+        let mut pane = state.pane_surface.as_ref().unwrap().panes[0].clone();
+        pane.content_revision = 100 + rev;
+        let patch = crate::protocol::PaneSurfacePatch {
             boot_id: "boot-1".into(),
             projection_revision: 1,
             base_surface_revision: rev,
             surface_revision: rev + 1,
-            spans: vec![crate::protocol::PaneSurfacePatchRow {
+            rows: vec![crate::protocol::PaneSurfacePatchRow {
                 x: 0,
                 y: 0,
                 cells: vec![cell_with_sym(&format!("{rev}"))],
             }],
-            row_moves: Vec::new(),
-            panes: vec![crate::protocol::delta::PaneSurfacePaneDelta {
-                pane_id: "pane_1".into(),
-                content_revision: crate::protocol::delta::SurfaceFieldUpdate::Set(100 + rev),
-                scroll: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                focused: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                mouse_reporting: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                sgr_pixel_mouse: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                alternate_screen_active: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                scrollbar_rect: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                rect: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                inner_rect: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                pixel_width: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                pixel_height: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-            }],
-            splits: None,
-            cursor: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-            appended_hyperlinks: Vec::new(),
-            graphics: None,
-            popup: None,
+            panes: vec![pane],
+            cursor: None,
         };
 
-        let outcome = state.apply_surface_delta(delta);
+        let outcome = state.apply_pane_surface_patch(patch);
         // Direct cell blit MUST be blocked by active selection
         assert!(
             matches!(
@@ -1624,7 +1608,7 @@ fn direct_blit_blocked_when_selection_deadline_or_word_gesture_active() {
 }
 
 #[test]
-fn mouse_drag_selection_rapid_snapshot_and_delta_interleaving() {
+fn mouse_drag_selection_rapid_snapshot_and_surface_interleaving() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
@@ -1673,42 +1657,15 @@ fn mouse_drag_selection_rapid_snapshot_and_delta_interleaving() {
             "selection must survive drag with empty hits"
         );
 
-        // Surface delta arrives catching up
-        let delta = crate::protocol::delta::ClientShellSurfaceDelta {
-            boot_id: "boot-1".into(),
-            projection_revision: step + 1,
-            base_surface_revision: step,
-            surface_revision: step + 1,
-            spans: vec![crate::protocol::PaneSurfacePatchRow {
-                x: 0,
-                y: 0,
-                cells: vec![cell_with_sym("Z")],
-            }],
-            row_moves: Vec::new(),
-            panes: vec![crate::protocol::delta::PaneSurfacePaneDelta {
-                pane_id: "pane_1".into(),
-                content_revision: crate::protocol::delta::SurfaceFieldUpdate::Set(100 + step),
-                scroll: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                focused: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                mouse_reporting: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                sgr_pixel_mouse: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                alternate_screen_active: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                scrollbar_rect: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                rect: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                inner_rect: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                pixel_width: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-                pixel_height: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-            }],
-            splits: None,
-            cursor: crate::protocol::delta::SurfaceFieldUpdate::Unchanged,
-            appended_hyperlinks: Vec::new(),
-            graphics: None,
-            popup: None,
-        };
-        state.apply_surface_delta(delta);
+        // Surface arrives catching up
+        let mut next_surface = surface();
+        next_surface.projection_revision = step + 1;
+        next_surface.surface_revision = step + 1;
+        next_surface.panes[0].content_revision = 100 + step;
+        state.set_pane_surface(next_surface);
         assert!(
             state.selection.is_some(),
-            "selection must survive surface delta"
+            "selection must survive surface update"
         );
     }
 

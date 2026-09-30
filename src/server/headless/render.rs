@@ -835,8 +835,6 @@ impl HeadlessServer {
             let prepared =
                 if let Some((panes, splits, popup, graphics, delivery, _)) = surface_parts {
                     next_shell_graphics_delivery = Some(delivery);
-                    let is_v2 =
-                        client.surface_codec == crate::protocol::endpoint::SURFACE_CODEC_DELTA_V2;
                     let candidate = protocol::PaneSurfaceFrame {
                         boot_id: self.client_shell_boot_id.clone(),
                         projection_revision: shell_projection_revision,
@@ -847,13 +845,9 @@ impl HeadlessServer {
                         popup,
                         graphics,
                     };
-                    if is_v2 {
-                        client.render_state.prepare_pane_surface_v2(candidate)
-                    } else {
-                        client
-                            .render_state
-                            .prepare_pane_surface_with_file(candidate, native_upload.is_some())
-                    }
+                    client
+                        .render_state
+                        .prepare_pane_surface_with_file(candidate, native_upload.is_some())
                 } else {
                     client.render_state.prepare_frame(frame)
                 };

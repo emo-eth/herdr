@@ -1860,12 +1860,6 @@ impl ClientShellState {
         self.reconcile_input_source();
         had_selection && (self.selection.is_none() && self.word_selection_gesture.is_none())
     }
-    pub(crate) fn apply_surface_delta(
-        &mut self,
-        delta: crate::protocol::delta::ClientShellSurfaceDelta,
-    ) -> crate::client::shell::surface_patch::ClientPaneSurfacePatchOutcome {
-        self.apply_pane_surface_delta(delta)
-    }
     pub(crate) fn commit_presentation_success(&mut self) {
         self.unpresented_damage.clear();
         if let Some(surface) = self.pane_surface.as_ref() {
